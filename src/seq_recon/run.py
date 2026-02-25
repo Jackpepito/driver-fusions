@@ -217,13 +217,17 @@ def run_chimerseq_reconstruction(
 
     # ── Initialize reconstructors (one per genome build) ─────────────────
     reconstructors = {}
+    cache_dirs = {}
     for b in builds_to_process:
+        cache_dirs[b] = str((Path("cache") / f"gtf_{b}_chimerseq").resolve())
         print(f"Initializing reconstructor for {b}...")
+        print(f"  Cache dir: {cache_dirs[b]}")
         try:
             reconstructors[b] = IsoformAwareFusionReconstructor(
                 mode='local',
                 gtf_path=DEFAULT_PATHS[b]['gtf'],
                 genome_path=DEFAULT_PATHS[b]['genome'],
+                cache_dir=cache_dirs[b],
                 use_orffinder=use_orffinder,
                 orffinder_path=orffinder_path
             )
@@ -514,6 +518,7 @@ def run_chimerseq_reconstruction(
         for b in builds_to_process:
             f.write(f"    {b}: GTF={DEFAULT_PATHS[b]['gtf']}\n")
             f.write(f"    {' '*len(b)}  Genome={DEFAULT_PATHS[b]['genome']}\n")
+            f.write(f"    {' '*len(b)}  Cache={cache_dirs[b]}\n")
         f.write(f"  Output prefix:   {output_prefix}\n")
         f.write(f"  Sample size:     {n_samples if n_samples else 'all'}\n")
         f.write(f"  ORFfinder:       {'enabled' if use_orffinder else 'disabled'}\n")

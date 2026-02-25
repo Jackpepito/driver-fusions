@@ -104,7 +104,7 @@ def main():
     def classify_driver(row):
         if row['has_seq_plus'] and row['is_recurrent'] and row['Frame'] == 'In-Frame' and ((row['H_gene_up'] in census_genes) or (row['T_gene_up'] in census_genes)):
             return "driver"
-        if row['has_seq_plus'] and ((row['H_gene_up'] in census_genes) or (row['T_gene_up'] in census_genes)) and row['Frame'] == 'In-Frame':
+        if not row['has_seq_plus'] and ((row['H_gene_up'] in census_genes) or (row['T_gene_up'] in census_genes)):# and row['Frame'] == 'In-Frame':
             return "non-driver"
         # set to None if it doesn't meet any criteria, to distinguish from non-driver that meets some criteria but not all
         return None

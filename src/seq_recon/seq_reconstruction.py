@@ -258,7 +258,8 @@ class IsoformAwareFusionReconstructor:
         self.mode = mode
         self.genome_build = genome_build
         self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
+        # Ensure nested cache paths exist regardless of current working directory.
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.use_orffinder = use_orffinder
         self.orffinder_path = orffinder_path
         

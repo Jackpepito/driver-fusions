@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-MAX_SEQ_LEN = 2000
+MAX_SEQ_LEN = 4000
 
 DEFAULT_INPUT = "/homes/gcapitani/driver-fusions/clustering/clustered_splits.csv"
 DEFAULT_OUTPUT = "/homes/gcapitani/driver-fusions/embeddings"
@@ -89,19 +89,29 @@ def main():
         labels = []
         cancer_types = []
         fusion_pairs = []
+        metadata_rows = []
         for i, row in split_df.iterrows():
             emb = embed_fn(row["reconstructed_seq"])
             embeddings.append(emb)
             labels.append(label_map.get(row["driver"], -1))
             cancer_types.append(row.get("Cancertype", ""))
             fusion_pairs.append(f"{row['H_gene']}-{row['T_gene']}")
+            # Keep full original row metadata for downstream analysis.
+            metadata_rows.append(row.to_dict())
             if (i + 1) % 50 == 0 or (i + 1) == n:
                 print(f"    [{i + 1}/{n}]")
 
         save_path = out_dir / f"{split}.pt"
-        torch.save({"embeddings": embeddings, "labels": labels,
-                     "cancer_types": cancer_types,
-                     "fusion_pairs": fusion_pairs}, save_path)
+        torch.save(
+            {
+                "embeddings": embeddings,
+                "labels": labels,
+                "cancer_types": cancer_types,
+                "fusion_pairs": fusion_pairs,
+                "metadata_rows": metadata_rows,
+            },
+            save_path,
+        )
         print(f"    -> {save_path}  (dim={embeddings[0].shape[-1]})")
 
     # ── Benchmark embeddings ─────────────────────────────────────────────
