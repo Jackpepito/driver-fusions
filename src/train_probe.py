@@ -2,6 +2,8 @@
 """Probe training on pre-computed embeddings for driver/non-driver classification."""
 
 import argparse
+import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +20,7 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
     precision_score,
+    roc_auc_score,
     recall_score,
 )
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
@@ -26,11 +29,18 @@ from scipy.stats import chi2_contingency, mannwhitneyu
 from nets import build_probe
 from utils import (
     load_embeddings, plot_umap_binary, plot_umap_cancer,
-    compute_metrics, print_test_results, print_per_fusion_results,
+    compute_metrics, print_test_results, print_per_fusion_results, BENCHMARK_GENE_PAIRS,
 )
 
-DEFAULT_EMB_DIR = "/homes/gcapitani/driver-fusions/embeddings"
-DEFAULT_OUTPUT = "/homes/gcapitani/driver-fusions/results"
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+DEFAULT_EMB_DIR = "/work/H2020DeciderFicarra/gcapitani/driver-fusion/embeddings"
+DEFAULT_OUTPUT = "/work/H2020DeciderFicarra/gcapitani/driver-fusion/results"
+DEFAULT_CONFIG_PATH = Path("configs/train_probe.yaml")
 
 EXPECTED_METADATA_COLS = {
     "seed_reads": "Seed_reads_num",
@@ -85,6 +95,43 @@ def format_test_results(metrics: dict, model_name: str, pool: str, title: str) -
     return "\n".join(lines)
 
 
+def format_benchmark_per_fusion_results(
+    preds: np.ndarray,
+    labels: np.ndarray,
+    fusion_pairs: list[str],
+    title: str = "BENCHMARK PER-FUSION BREAKDOWN (BEST AUROC MODEL)",
+) -> str:
+    """Create a summary block for benchmark gene1-gene2 fusion performance."""
+    preds = np.array(preds)
+    labels = np.array(labels)
+    fusions = np.array(fusion_pairs, dtype=object)
+    benchmark_names = sorted({f"{g1}-{g2}" for g1, g2 in BENCHMARK_GENE_PAIRS})
+
+    lines = [
+        f"{'='*60}",
+        title,
+        f"{'='*60}",
+        "fusion_pair,n,pred_driver,pred_non_driver,correct,accuracy",
+    ]
+
+    for name in benchmark_names:
+        mask = fusions == name
+        n = int(mask.sum())
+        if n == 0:
+            lines.append(f"{name},0,0,0,0,N/A")
+            continue
+
+        pred_driver = int((preds[mask] == 1).sum())
+        pred_non_driver = n - pred_driver
+        correct = int((preds[mask] == labels[mask]).sum())
+        accuracy = float(correct / n)
+        lines.append(
+            f"{name},{n},{pred_driver},{pred_non_driver},{correct},{accuracy:.4f}"
+        )
+
+    return "\n".join(lines)
+
+
 def format_experiment_config(args, device: str, emb_dir: Path, out_dir: Path, run_id: str,
                              dim: int, n_train: int, n_val: int, n_test: int) -> str:
     loss_name = "cross_entropy" if args.focal_gamma == 0 else f"focal_loss(gamma={args.focal_gamma})"
@@ -104,6 +151,9 @@ def format_experiment_config(args, device: str, emb_dir: Path, out_dir: Path, ru
         f"  patience:          {args.patience}",
         f"  batch_size:        {args.batch_size}",
         f"  lr:                {args.lr}",
+        f"  lr_scheduler:      {args.lr_scheduler}",
+        f"  lr_reduce_factor:  {args.lr_reduce_factor}",
+        f"  lr_min:            {args.lr_min}",
         f"  seed:              {args.seed}",
         f"  device:            {device}",
         f"  embedding_dim:     {dim}",
@@ -114,6 +164,56 @@ def format_experiment_config(args, device: str, emb_dir: Path, out_dir: Path, ru
         f"  output_dir:        {out_dir}",
     ]
     return "\n".join(lines)
+
+
+def load_yaml_config(config_path: Path) -> dict:
+    if not config_path.exists():
+        return {}
+
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except ModuleNotFoundError:
+        # Fallback parser for flat "key: value" YAML configs.
+        data = {}
+        float_re = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
+        int_re = re.compile(r"^[+-]?\d+$")
+        with open(config_path, "r", encoding="utf-8") as f:
+            for lineno, raw in enumerate(f, start=1):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if ":" not in line:
+                    raise ValueError(f"Invalid YAML line {lineno} in {config_path}: {raw.rstrip()}")
+                key, value = line.split(":", 1)
+                key = key.strip()
+                value = value.strip()
+
+                if value == "" or value.lower() in {"null", "none", "~"}:
+                    parsed = ""
+                elif value.lower() in {"true", "false"}:
+                    parsed = value.lower() == "true"
+                elif (value.startswith('"') and value.endswith('"')) or (
+                    value.startswith("'") and value.endswith("'")
+                ):
+                    parsed = value[1:-1]
+                elif int_re.match(value):
+                    parsed = int(value)
+                elif float_re.match(value):
+                    parsed = float(value)
+                else:
+                    parsed = value
+                data[key] = parsed
+
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"YAML config must be a mapping (dict), got: {type(data).__name__}")
+
+    # Accept both "batch-size" and "batch_size" style keys in config files.
+    normalized = {str(k).replace("-", "_"): v for k, v in data.items()}
+    return normalized
 
 
 def train_epoch(model, loader, optim, criterion, device, noise_std: float = 0.0):
@@ -129,6 +229,35 @@ def train_epoch(model, loader, optim, criterion, device, noise_std: float = 0.0)
         optim.step()
         total_loss += loss.item() * len(y)
     return total_loss / len(loader.dataset)
+
+
+@torch.no_grad()
+def evaluate_split(model, X: torch.Tensor, y: torch.Tensor, criterion, device: str) -> dict:
+    """Evaluate one split returning both loss and standard binary metrics."""
+    model.eval()
+    logits = model(X.to(device))
+    y_dev = y.to(device)
+    loss = float(criterion(logits, y_dev).item())
+    probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+    preds = logits.argmax(dim=1).cpu().numpy()
+    y_np = y.cpu().numpy()
+
+    try:
+        auroc = float(roc_auc_score(y_np, probs))
+    except ValueError:
+        auroc = float("nan")
+
+    return {
+        "loss": loss,
+        "acc": float(accuracy_score(y_np, preds)),
+        "f1": float(f1_score(y_np, preds, zero_division=0)),
+        "auroc": auroc,
+        "prec": float(precision_score(y_np, preds, zero_division=0)),
+        "rec": float(recall_score(y_np, preds, zero_division=0)),
+        "preds": preds,
+        "probs": probs,
+        "labels": y_np,
+    }
 
 
 def _safe_numeric(series: pd.Series) -> pd.Series:
@@ -201,6 +330,110 @@ def _write_text_lines(path: Path, lines: list[str]) -> Path:
     return path
 
 
+def _clean_category_value(v) -> str:
+    s = str(v).strip()
+    if s.lower() in {"", "nan", "none", ".", "na", "n/a"}:
+        return "UNKNOWN"
+    return s
+
+
+def _frame_distribution_by_split(meta: dict, labels: np.ndarray, split_name: str) -> pd.DataFrame:
+    rows = meta.get("metadata_rows")
+    if not rows:
+        return pd.DataFrame()
+    if len(rows) != len(labels):
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    frame_col = _find_col(df, ["Frame"])
+    if frame_col is None:
+        return pd.DataFrame()
+
+    tmp = pd.DataFrame(
+        {
+            "split": split_name,
+            "Frame": df[frame_col].map(_clean_category_value),
+            "y_true": labels.astype(int),
+        }
+    )
+
+    in_frame_col = _find_col(df, ["in_frame", "inframe"])
+    if in_frame_col is not None:
+        in_frame_bin = _to_binary(df[in_frame_col])
+        tmp["in_frame_bin"] = in_frame_bin.values
+    else:
+        tmp["in_frame_bin"] = np.nan
+
+    out = (
+        tmp.groupby(["split", "Frame"], dropna=False)
+        .agg(
+            n=("y_true", "size"),
+            n_driver=("y_true", "sum"),
+            n_in_frame=("in_frame_bin", lambda s: int((s == 1).sum())),
+            n_not_in_frame=("in_frame_bin", lambda s: int((s == 0).sum())),
+            n_in_frame_missing=("in_frame_bin", lambda s: int(s.isna().sum())),
+        )
+        .reset_index()
+    )
+    out["n_non_driver"] = out["n"] - out["n_driver"]
+    out["driver_rate"] = out["n_driver"] / out["n"]
+    known_in_frame = out["n_in_frame"] + out["n_not_in_frame"]
+    out["in_frame_rate_known"] = np.where(known_in_frame > 0, out["n_in_frame"] / known_in_frame, np.nan)
+    return out.sort_values(["split", "n"], ascending=[True, False]).reset_index(drop=True)
+
+
+def _print_frame_split_distribution(frame_split_df: pd.DataFrame):
+    print(f"\n{'='*60}")
+    print("FRAME DISTRIBUTION ACROSS SPLITS (TRUE LABELS)")
+    print(f"{'='*60}")
+    if frame_split_df is None or frame_split_df.empty:
+        print("Frame column unavailable in split metadata.")
+        return
+
+    for split in ["train", "val", "test"]:
+        part = frame_split_df[frame_split_df["split"] == split]
+        if part.empty:
+            continue
+        total = int(part["n"].sum())
+        total_drv = int(part["n_driver"].sum())
+        total_non = int(part["n_non_driver"].sum())
+        print(f"\n[{split}] total={total} | driver={total_drv} | non-driver={total_non}")
+        for _, r in part.iterrows():
+            print(
+                f"  - Frame={r['Frame']}: n={int(r['n'])}, "
+                f"driver={int(r['n_driver'])}, non-driver={int(r['n_non_driver'])}, "
+                f"driver_rate={float(r['driver_rate']):.4f}, "
+                f"in_frame={int(r['n_in_frame'])}, not_in_frame={int(r['n_not_in_frame'])}, "
+                f"in_frame_missing={int(r['n_in_frame_missing'])}, "
+                f"in_frame_rate_known={float(r['in_frame_rate_known']):.4f}"
+            )
+
+
+def _print_test_frame_breakdown(frame_stats: pd.DataFrame):
+    print(f"\n{'='*60}")
+    print("TEST FRAME BREAKDOWN (TRUE VS PRED)")
+    print(f"{'='*60}")
+    if frame_stats is None or frame_stats.empty:
+        print("Frame column unavailable in test metadata.")
+        return
+    for _, r in frame_stats.iterrows():
+        print(
+            f"  - Frame={r['Frame']}: n={int(r['n'])}, "
+            f"acc={float(r['accuracy']):.4f}, "
+            f"driver_correct={int(r['driver_correct'])}/{int(r['n_driver'])}, "
+            f"non_driver_correct={int(r['non_driver_correct'])}/{int(r['n_non_driver'])}"
+        )
+
+
+def _normalize_fusion_name(v) -> str:
+    s = str(v).strip()
+    if s.lower() in {"", "nan", "none", ".", "na", "n/a"}:
+        return ""
+    s = re.sub(r"\s+", "", s)
+    s = s.replace("_", "-")
+    return s.upper()
+
+
 def _fusion_label_series(df: pd.DataFrame) -> pd.Series:
     for col in ["Fusion_pair", "fusion_pair", "id"]:
         if col in df.columns:
@@ -210,6 +443,32 @@ def _fusion_label_series(df: pd.DataFrame) -> pd.Series:
     if "H_gene" in df.columns and "T_gene" in df.columns:
         return df["H_gene"].astype(str).str.strip() + "-" + df["T_gene"].astype(str).str.strip()
     return pd.Series([f"row_{i}" for i in range(len(df))], index=df.index, dtype="object")
+
+
+def _extract_fusion_name_set(meta: dict) -> set[str]:
+    if "metadata_rows" in meta and meta["metadata_rows"]:
+        df = pd.DataFrame(meta["metadata_rows"])
+        names = _fusion_label_series(df).map(_normalize_fusion_name)
+    else:
+        names = pd.Series(meta.get("fusion_pairs", []), dtype="object").map(_normalize_fusion_name)
+    names = names[(names != "")]
+    return set(names.tolist())
+
+
+def _print_seen_vs_novel_breakdown(seen_stats: pd.DataFrame):
+    print(f"\n{'='*60}")
+    print("TEST BREAKDOWN: FUSIONS SEEN IN TRAIN VS NOVEL")
+    print(f"{'='*60}")
+    if seen_stats is None or seen_stats.empty:
+        print("Seen/novel fusion breakdown unavailable.")
+        return
+    for _, r in seen_stats.iterrows():
+        print(
+            f"  - {r['group']}: n={int(r['n'])}, unique_fusions={int(r['n_unique_fusions'])}, "
+            f"acc={float(r['accuracy']):.4f}, "
+            f"driver_correct={int(r['driver_correct'])}/{int(r['n_driver'])}, "
+            f"non_driver_correct={int(r['non_driver_correct'])}/{int(r['n_non_driver'])}"
+        )
 
 
 def _top_probability_tables(df: pd.DataFrame, prob_col: str, n: int = 10) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -606,6 +865,7 @@ def analyze_test_predictions(
     meta_test: dict,
     metrics: dict,
     out_dir: Path,
+    train_fusion_names: set[str] | None = None,
 ) -> dict:
     """Analyze test-set predictions by metadata and save analysis artifacts."""
     preds = np.array(metrics["preds"])
@@ -648,6 +908,101 @@ def analyze_test_predictions(
         ).reset_index().sort_values("n", ascending=False)
         cancer_csv = out_dir / "test_cancer_type_breakdown.csv"
         cancer_stats.to_csv(cancer_csv, index=False)
+
+    # ── Frame breakdown (accuracy and per-class correctness) ────────────
+    frame_csv = None
+    frame_stats = pd.DataFrame()
+    frame_col = _find_col(df, ["Frame"])
+    if frame_col is not None:
+        tf = df.copy()
+        tf["Frame"] = tf[frame_col].map(_clean_category_value)
+        frame_stats = (
+            tf.groupby("Frame", dropna=False)
+            .agg(
+                n=("y_true", "size"),
+                n_driver=("y_true", "sum"),
+                correct_total=("is_correct", "sum"),
+                driver_correct=("y_true", lambda s: int(((s == 1) & (tf.loc[s.index, "y_pred"] == 1)).sum())),
+                non_driver_correct=("y_true", lambda s: int(((s == 0) & (tf.loc[s.index, "y_pred"] == 0)).sum())),
+            )
+            .reset_index()
+            .sort_values("n", ascending=False)
+        )
+        frame_stats["n_non_driver"] = frame_stats["n"] - frame_stats["n_driver"]
+        frame_stats["accuracy"] = frame_stats["correct_total"] / frame_stats["n"]
+        frame_stats["driver_accuracy"] = np.where(
+            frame_stats["n_driver"] > 0,
+            frame_stats["driver_correct"] / frame_stats["n_driver"],
+            np.nan,
+        )
+        frame_stats["non_driver_accuracy"] = np.where(
+            frame_stats["n_non_driver"] > 0,
+            frame_stats["non_driver_correct"] / frame_stats["n_non_driver"],
+            np.nan,
+        )
+        frame_csv = out_dir / "test_frame_breakdown.csv"
+        frame_stats.to_csv(frame_csv, index=False)
+
+    # ── Seen-in-train vs novel fusions (test set) ───────────────────────
+    seen_vs_train_csv = None
+    seen_vs_train_stats = pd.DataFrame()
+    if train_fusion_names:
+        tf = df.copy()
+        tf["fusion_name"] = _fusion_label_series(tf).map(_normalize_fusion_name)
+        tf = tf[tf["fusion_name"] != ""].copy()
+        if not tf.empty:
+            tf["seen_in_train"] = tf["fusion_name"].isin(train_fusion_names)
+            seen_vs_train_stats = (
+                tf.groupby("seen_in_train", dropna=False)
+                .agg(
+                    n=("y_true", "size"),
+                    n_unique_fusions=("fusion_name", "nunique"),
+                    n_driver=("y_true", "sum"),
+                    correct_total=("is_correct", "sum"),
+                    driver_correct=("y_true", lambda s: int(((s == 1) & (tf.loc[s.index, "y_pred"] == 1)).sum())),
+                    non_driver_correct=("y_true", lambda s: int(((s == 0) & (tf.loc[s.index, "y_pred"] == 0)).sum())),
+                )
+                .reset_index()
+            )
+            seen_vs_train_stats["group"] = np.where(
+                seen_vs_train_stats["seen_in_train"], "seen_in_train", "novel_not_in_train"
+            )
+            seen_vs_train_stats["n_non_driver"] = seen_vs_train_stats["n"] - seen_vs_train_stats["n_driver"]
+            seen_vs_train_stats["accuracy"] = seen_vs_train_stats["correct_total"] / seen_vs_train_stats["n"]
+            seen_vs_train_stats["driver_accuracy"] = np.where(
+                seen_vs_train_stats["n_driver"] > 0,
+                seen_vs_train_stats["driver_correct"] / seen_vs_train_stats["n_driver"],
+                np.nan,
+            )
+            seen_vs_train_stats["non_driver_accuracy"] = np.where(
+                seen_vs_train_stats["n_non_driver"] > 0,
+                seen_vs_train_stats["non_driver_correct"] / seen_vs_train_stats["n_non_driver"],
+                np.nan,
+            )
+            seen_vs_train_stats = seen_vs_train_stats.sort_values("seen_in_train", ascending=False).reset_index(drop=True)
+            seen_vs_train_csv = out_dir / "test_seen_vs_novel_fusion_breakdown.csv"
+            seen_vs_train_stats.to_csv(seen_vs_train_csv, index=False)
+
+    # ── Per-sample test predictions sorted by P(driver) ─────────────────
+    pred_sorted_txt = None
+    pred_rank = df.copy()
+    pred_rank["fusion_name"] = _fusion_label_series(pred_rank).map(_normalize_fusion_name)
+    if train_fusion_names:
+        pred_rank["seen_in_train"] = pred_rank["fusion_name"].isin(train_fusion_names)
+        pred_rank["seen_in_train"] = np.where(pred_rank["seen_in_train"], "yes", "no")
+    else:
+        pred_rank["seen_in_train"] = "unknown"
+    pred_rank["y_prob_driver"] = pd.to_numeric(pred_rank["y_prob_driver"], errors="coerce")
+    pred_rank = pred_rank.dropna(subset=["y_prob_driver"]).sort_values("y_prob_driver", ascending=False).reset_index(drop=True)
+    pred_sorted_txt = out_dir / "test_predictions_ranked_by_p_driver.txt"
+    lines = [
+        "rank,fusion_name,p_driver,predicted_label,true_label,seen_in_train",
+    ]
+    for i, r in pred_rank.iterrows():
+        lines.append(
+            f"{i+1},{r['fusion_name']},{float(r['y_prob_driver']):.6f},{r['predicted_label']},{r['true_label']},{r['seen_in_train']}"
+        )
+    _write_text_lines(pred_sorted_txt, lines)
 
     # ── Generic numeric feature associations (predicted driver vs non-driver) ──
     numeric_rows = []
@@ -961,6 +1316,11 @@ def analyze_test_predictions(
     return {
         "pred_csv": pred_csv,
         "cancer_csv": cancer_csv,
+        "frame_csv": frame_csv,
+        "frame_stats": frame_stats,
+        "seen_vs_train_csv": seen_vs_train_csv,
+        "seen_vs_train_stats": seen_vs_train_stats,
+        "pred_sorted_txt": pred_sorted_txt,
         "numeric_csv": numeric_csv,
         "cat_csv": cat_csv,
         "plot_pred_prob": plot_pred_prob,
@@ -988,7 +1348,14 @@ def analyze_test_predictions(
 
 
 def main():
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    pre_args, _ = pre_parser.parse_known_args()
+    yaml_config = load_yaml_config(Path(pre_args.config))
+
     parser = argparse.ArgumentParser(description="Train probe model for driver classification")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH),
+                        help="YAML config file path. CLI flags override YAML values.")
     parser.add_argument("--embeddings-dir", default=DEFAULT_EMB_DIR)
     parser.add_argument("--model", default="esmc", choices=["esmc", "fuson"])
     parser.add_argument("--pool", default="mean", choices=["mean", "cls"])
@@ -996,6 +1363,24 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--patience", type=int, default=2000)
+    parser.add_argument(
+        "--lr-scheduler",
+        default="plateau",
+        choices=["none", "plateau"],
+        help="Learning-rate scheduler strategy. 'plateau' halves LR on validation plateau.",
+    )
+    parser.add_argument(
+        "--lr-reduce-factor",
+        type=float,
+        default=0.5,
+        help="Factor used by plateau scheduler when patience is reached.",
+    )
+    parser.add_argument(
+        "--lr-min",
+        type=float,
+        default=1e-7,
+        help="Minimum LR allowed when using a scheduler.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     parser.add_argument(
@@ -1022,6 +1407,15 @@ def main():
         default=2.0,
         help="Focal loss gamma. Set to 0.0 to recover standard cross-entropy.",
     )
+
+    valid_dests = {a.dest for a in parser._actions}
+    unknown_cfg_keys = sorted(k for k in yaml_config if k not in valid_dests)
+    if unknown_cfg_keys:
+        raise ValueError(
+            f"Unknown keys in config {pre_args.config}: {unknown_cfg_keys}. "
+            "Use argument names (e.g., batch_size, probe_hidden_dims)."
+        )
+    parser.set_defaults(**yaml_config)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1032,7 +1426,7 @@ def main():
     print(f"Loading embeddings from {emb_dir}")
 
     X_train, y_train, meta_train = load_embeddings(emb_dir, "train", args.pool)
-    X_val, y_val, _ = load_embeddings(emb_dir, "val", args.pool)
+    X_val, y_val, meta_val = load_embeddings(emb_dir, "val", args.pool)
     X_test, y_test, meta_test = load_embeddings(emb_dir, "test", args.pool)
 
     dim = X_train.shape[1]
@@ -1045,6 +1439,22 @@ def main():
     out_dir = Path(args.output_dir) / args.model / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Saving outputs to {out_dir}")
+
+    # Frame distribution by split (true labels from loaded embeddings)
+    frame_dist_parts = [
+        _frame_distribution_by_split(meta_train, y_train.cpu().numpy(), "train"),
+        _frame_distribution_by_split(meta_val, y_val.cpu().numpy(), "val"),
+        _frame_distribution_by_split(meta_test, y_test.cpu().numpy(), "test"),
+    ]
+    frame_split_df = pd.concat([p for p in frame_dist_parts if not p.empty], ignore_index=True) if any(
+        not p.empty for p in frame_dist_parts
+    ) else pd.DataFrame()
+    _print_frame_split_distribution(frame_split_df)
+    if not frame_split_df.empty:
+        frame_split_path = out_dir / "frame_split_distribution.csv"
+        frame_split_df.to_csv(frame_split_path, index=False)
+        print(f"Frame split distribution saved to {frame_split_path}")
+
     plot_umap_binary(X_train, y_train, out_dir / "umap_driver.png",
                      title=f"{args.model.upper()} — driver vs non-driver")
     if "cancer_types" in meta_train:
@@ -1064,16 +1474,24 @@ def main():
         dropout=args.probe_dropout,
     ).to(device)
     optim = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = None
+    if args.lr_scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optim,
+            mode="max",
+            factor=args.lr_reduce_factor,
+            patience=args.patience,
+            min_lr=args.lr_min,
+        )
     criterion = FocalLoss(gamma=args.focal_gamma)
     loader = DataLoader(TensorDataset(X_train, y_train),
                         batch_size=args.batch_size, sampler=sampler)
 
     best_auroc = 0
     best_state = None
-    wait = 0
 
     for ep in range(1, args.epochs + 1):
-        loss = train_epoch(
+        train_loss = train_epoch(
             model,
             loader,
             optim,
@@ -1081,23 +1499,31 @@ def main():
             device,
             noise_std=args.train_noise_std,
         )
-        val = compute_metrics(model, X_val, y_val, device)
+        val = evaluate_split(model, X_val, y_val, criterion, device)
+        test_epoch = evaluate_split(model, X_test, y_test, criterion, device)
 
         improved = val["auroc"] > best_auroc
         if improved:
             best_auroc = val["auroc"]
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
-            wait = 0
 
-        if ep % 10 == 0 or ep == 1 or improved:
-            flag = " *" if improved else ""
-            print(f"  ep {ep:3d} | loss {loss:.4f} | "
-                  f"val_auroc {val['auroc']:.4f} | val_f1 {val['f1']:.4f}{flag}")
-
-        wait += 0 if improved else 1
-        if wait >= args.patience:
-            print(f"  Early stopping at epoch {ep}")
-            break
+        prev_lr = optim.param_groups[0]["lr"]
+        if scheduler is not None:
+            scheduler.step(val["auroc"])
+        curr_lr = optim.param_groups[0]["lr"]
+        flag = " *" if improved else ""
+        print(
+            f"  ep {ep:3d} | "
+            f"train_loss {train_loss:.4f} | "
+            f"val_loss {val['loss']:.4f} | val_auroc {val['auroc']:.4f} | val_f1 {val['f1']:.4f} | "
+            f"test_loss {test_epoch['loss']:.4f} | test_auroc {test_epoch['auroc']:.4f} | test_f1 {test_epoch['f1']:.4f} | "
+            f"lr {curr_lr:.6g}{flag}"
+        )
+        if curr_lr < prev_lr:
+            print(
+                f"  LR reduced at epoch {ep}: {prev_lr:.6g} -> {curr_lr:.6g} "
+                f"(factor={args.lr_reduce_factor}, patience={args.patience})"
+            )
 
     # Capture last epoch state
     last_state = {k: v.clone() for k, v in model.state_dict().items()}
@@ -1150,10 +1576,24 @@ def main():
     print(f"Last model saved to {out_dir / 'probe_last.pt'}")
 
     # Save test prediction analysis (based on full test metadata, when available)
-    analysis_artifacts = analyze_test_predictions(meta_test, t_best, out_dir)
+    train_fusion_names = _extract_fusion_name_set(meta_train)
+    analysis_artifacts = analyze_test_predictions(
+        meta_test,
+        t_best,
+        out_dir,
+        train_fusion_names=train_fusion_names,
+    )
     print(f"Test predictions + metadata saved to {analysis_artifacts['pred_csv']}")
     if analysis_artifacts["cancer_csv"] is not None:
         print(f"Cancer-type breakdown saved to {analysis_artifacts['cancer_csv']}")
+    if analysis_artifacts["frame_csv"] is not None:
+        print(f"Frame breakdown (test) saved to {analysis_artifacts['frame_csv']}")
+        _print_test_frame_breakdown(analysis_artifacts["frame_stats"])
+    if analysis_artifacts["seen_vs_train_csv"] is not None:
+        print(f"Seen-vs-novel fusion breakdown (test) saved to {analysis_artifacts['seen_vs_train_csv']}")
+        _print_seen_vs_novel_breakdown(analysis_artifacts["seen_vs_train_stats"])
+    if analysis_artifacts["pred_sorted_txt"] is not None:
+        print(f"Ranked test predictions (with seen_in_train) saved to {analysis_artifacts['pred_sorted_txt']}")
     print(f"Numeric feature associations saved to {analysis_artifacts['numeric_csv']}")
     print(f"Categorical feature associations saved to {analysis_artifacts['cat_csv']}")
     if analysis_artifacts["plot_pred_prob"] is not None:
@@ -1218,6 +1658,14 @@ def main():
                 bm_best, f"{args.model} [benchmark]", args.pool, "BENCHMARK - BEST AUROC MODEL"
             ),
         ])
+        bm_pairs = meta_bm.get("fusion_pairs", [])
+        if bm_pairs:
+            summary_sections.extend([
+                "",
+                format_benchmark_per_fusion_results(
+                    bm_best["preds"], bm_best["labels"], bm_pairs
+                ),
+            ])
 
     summary_sections.extend([
         "",
@@ -1225,7 +1673,10 @@ def main():
         "TEST SET PREDICTION ANALYSIS (BEST MODEL)",
         f"{'='*60}",
         f"Predictions with metadata: {analysis_artifacts['pred_csv']}",
+        f"Ranked test predictions (P(driver), with seen_in_train): {analysis_artifacts['pred_sorted_txt'] if analysis_artifacts['pred_sorted_txt'] else 'N/A'}",
         f"Cancer-type breakdown: {analysis_artifacts['cancer_csv'] if analysis_artifacts['cancer_csv'] else 'N/A (Cancertype missing)'}",
+        f"Frame breakdown (test): {analysis_artifacts['frame_csv'] if analysis_artifacts['frame_csv'] else 'N/A (Frame missing)'}",
+        f"Seen-vs-novel fusion breakdown (test): {analysis_artifacts['seen_vs_train_csv'] if analysis_artifacts['seen_vs_train_csv'] else 'N/A (fusion names unavailable)'}",
         f"Numeric associations: {analysis_artifacts['numeric_csv']}",
         f"Categorical associations: {analysis_artifacts['cat_csv']}",
         f"Probability distribution plot: {analysis_artifacts['plot_pred_prob'] if analysis_artifacts['plot_pred_prob'] else 'N/A'}",

@@ -17,6 +17,12 @@ import shutil
 
 import pandas as pd
 
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 # Keep local imports consistent with run.py behavior
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -439,7 +445,7 @@ def main():
     parser.add_argument(
         "--input",
         type=str,
-        default="/homes/gcapitani/driver-fusions/data/Fusions_set1-17.csv",
+        default="/work/H2020DeciderFicarra/gcapitani/driver-fusion/data/Fusions_set1-17.csv",
         help="Path to Fusions_set1-17 input file (TSV format)",
     )
     parser.add_argument(
@@ -470,7 +476,7 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="/homes/gcapitani/driver-fusions/fusions_set1_17",
+        default="/work/H2020DeciderFicarra/gcapitani/driver-fusion/fusions_set1_17",
         help="Output prefix for results/log/analysis",
     )
     parser.add_argument(

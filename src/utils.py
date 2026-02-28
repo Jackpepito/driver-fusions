@@ -23,12 +23,28 @@ def load_embeddings(emb_dir: Path, split: str, pool: str = "mean"):
     like 'cancer_types'.
     """
     data = torch.load(emb_dir / f"{split}.pt", weights_only=False)
-    if pool == "mean":
-        X = torch.stack([e.mean(dim=0) for e in data["embeddings"]])
-    elif pool == "cls":
-        X = torch.stack([e[0] for e in data["embeddings"]])
+    embeddings = data["embeddings"]
+    if not embeddings:
+        raise ValueError(f"No embeddings found in {emb_dir / f'{split}.pt'}")
+
+    first = embeddings[0]
+    if first.ndim == 1:
+        if pool == "cls":
+            raise ValueError(
+                f"Split '{split}' contains mean-pooled embeddings (1D vectors). "
+                "CLS pooling is unavailable on this file."
+            )
+        X = torch.stack(embeddings)
+    elif first.ndim == 2:
+        if pool == "mean":
+            X = torch.stack([e.mean(dim=0) for e in embeddings])
+        elif pool == "cls":
+            X = torch.stack([e[0] for e in embeddings])
+        else:
+            raise ValueError(f"Unknown pool mode: {pool}")
     else:
-        raise ValueError(f"Unknown pool mode: {pool}")
+        raise ValueError(f"Unsupported embedding rank: {first.ndim}")
+
     y = torch.tensor(data["labels"], dtype=torch.long)
     meta = {k: data[k] for k in data if k not in ("embeddings", "labels")}
     return X, y, meta

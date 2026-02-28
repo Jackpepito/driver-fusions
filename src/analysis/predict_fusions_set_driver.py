@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from nets import ProbeMLP
 
-MAX_SEQ_LEN = 2000
+MAX_SEQ_LEN = 4000
 
 
 def load_esmc(device: str):
@@ -34,6 +34,14 @@ def load_esmc(device: str):
     return model
 
 
+def load_fuson(device: str):
+    from transformers import AutoModel, AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("ChatterjeeLab/FusOn-pLM")
+    model = AutoModel.from_pretrained("ChatterjeeLab/FusOn-pLM").to(device)
+    model.eval()
+    return model, tokenizer
+
+
 @torch.no_grad()
 def embed_esmc(model, seq: str):
     from esm.sdk.api import ESMProtein, LogitsConfig
@@ -41,6 +49,20 @@ def embed_esmc(model, seq: str):
     pt = model.encode(protein)
     out = model.logits(pt, LogitsConfig(sequence=True, return_embeddings=True))
     return out.embeddings.squeeze().detach().cpu()
+
+
+@torch.no_grad()
+def embed_fuson(model_tok, seq: str, device: str):
+    model, tokenizer = model_tok
+    inputs = tokenizer(
+        seq[:MAX_SEQ_LEN],
+        return_tensors="pt",
+        truncation=True,
+        max_length=MAX_SEQ_LEN,
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    out = model(**inputs)
+    return out.last_hidden_state.squeeze(0)[1:-1, :].detach().cpu()
 
 
 def infer_hidden_dims_from_state(state: dict) -> tuple[int, list[int], int]:
@@ -76,6 +98,27 @@ def build_model_from_checkpoint(ckpt_path: Path, device: str):
     model.load_state_dict(state)
     model.eval()
     return model, in_dim, hidden_dims, out_dim
+
+
+def infer_embedding_model(ckpt_path: Path, in_dim: int, requested: str) -> str:
+    if requested in {"esmc", "fuson"}:
+        return requested
+
+    ckpt_lower = str(ckpt_path).lower()
+    if "fuson" in ckpt_lower:
+        return "fuson"
+    if "esmc" in ckpt_lower:
+        return "esmc"
+
+    if in_dim == 1280:
+        return "fuson"
+    if in_dim == 1152:
+        return "esmc"
+
+    raise ValueError(
+        "Unable to infer embedding model automatically. "
+        "Use --embedding-model {esmc,fuson}."
+    )
 
 
 def sequence_signature(sequences: list[str]) -> str:
@@ -883,11 +926,22 @@ def main():
     )
     parser.add_argument(
         "--model-ckpt",
-        default="/homes/gcapitani/driver-fusions/results/esmc/20260225_005912/probe_best.pt",
+        default="/homes/gcapitani/driver-fusions/results/esmc/20260225_025900/probe_best.pt",
+    )
+    parser.add_argument(
+        "--model",
+        dest="model_ckpt",
+        help="Alias for --model-ckpt (kept for backward compatibility).",
     )
     parser.add_argument(
         "--output-dir",
         default="/homes/gcapitani/driver-fusions/src/analysis/fusions_set_driver_analysis",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default="auto",
+        choices=["auto", "esmc", "fuson"],
+        help="Embedding encoder used for inference. 'auto' infers from checkpoint.",
     )
     parser.add_argument("--pool", choices=["mean", "cls"], default="mean")
     parser.add_argument(
@@ -898,7 +952,7 @@ def main():
     )
     parser.add_argument(
         "--emb-cache-dir",
-        default="/homes/gcapitani/driver-fusions/embeddings/fusions_set_cache",
+        default="/work/H2020DeciderFicarra/gcapitani/driver-fusion/embeddings/fusions_set_cache",
         help="Directory where ESM-C embeddings are cached and reused",
     )
     parser.add_argument(
@@ -926,12 +980,14 @@ def main():
     print(f"Loading probe checkpoint: {model_ckpt}")
     model, in_dim, hidden_dims, out_dim = build_model_from_checkpoint(model_ckpt, device)
     print(f"Probe architecture inferred: in_dim={in_dim}, hidden_dims={hidden_dims}, out_dim={out_dim}")
+    embedding_model = infer_embedding_model(model_ckpt, in_dim, args.embedding_model)
+    print(f"Embedding model selected: {embedding_model}")
 
     sequences = df["reconstructed_seq"].astype(str).tolist()
     seq_sig = sequence_signature(sequences)
     cache_dir = Path(args.emb_cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_name = args.emb_cache_name.strip() or f"{input_csv.stem}_esmc_{args.pool}.pt"
+    cache_name = args.emb_cache_name.strip() or f"{input_csv.stem}_{embedding_model}_{args.pool}.pt"
     if not cache_name.endswith(".pt"):
         cache_name += ".pt"
     cache_path = cache_dir / cache_name
@@ -942,7 +998,8 @@ def main():
             cached = torch.load(cache_path, map_location="cpu", weights_only=False)
             same_sig = cached.get("sequence_signature", "") == seq_sig
             same_pool = cached.get("pool", "") == args.pool
-            same_encoder = cached.get("encoder", "") == "esmc_600m"
+            expected_encoder = "esmc_600m" if embedding_model == "esmc" else "fuson_plm"
+            same_encoder = cached.get("encoder", "") == expected_encoder
             if same_sig and same_pool and same_encoder:
                 emb_rows = cached.get("embeddings", None)
                 print(f"Loaded cached embeddings: {cache_path}")
@@ -952,12 +1009,20 @@ def main():
             print(f"Failed to read embedding cache ({e}), recomputing embeddings.")
 
     if emb_rows is None:
-        print("Loading ESM-C encoder...")
-        esmc = load_esmc(device)
+        if embedding_model == "esmc":
+            print("Loading ESM-C encoder...")
+            encoder = load_esmc(device)
+            embed_fn = lambda seq: embed_esmc(encoder, seq)
+            encoder_tag = "esmc_600m"
+        else:
+            print("Loading FusOn-pLM encoder...")
+            encoder = load_fuson(device)
+            embed_fn = lambda seq: embed_fuson(encoder, seq, device)
+            encoder_tag = "fuson_plm"
         print("Computing embeddings...")
         emb_rows = []
         for i, seq in enumerate(sequences, start=1):
-            emb = embed_esmc(esmc, seq)
+            emb = embed_fn(seq)
             x = emb.mean(dim=0) if args.pool == "mean" else emb[0]
             if int(x.shape[0]) != int(in_dim):
                 raise ValueError(f"Embedding dim mismatch at row {i}: got {x.shape[0]}, expected {in_dim}")
@@ -966,7 +1031,7 @@ def main():
                 print(f"  Embedded {i}/{len(df)}")
         torch.save(
             {
-                "encoder": "esmc_600m",
+                "encoder": encoder_tag,
                 "pool": args.pool,
                 "input_csv": str(input_csv),
                 "sequence_signature": seq_sig,

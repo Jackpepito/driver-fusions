@@ -1,0 +1,7 @@
+results*
+embeddings*
+cache*
+src/__pycache__/
+src/*.pyc
+src/*.pyo
+src/analysis/fusions*

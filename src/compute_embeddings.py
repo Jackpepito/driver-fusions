@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Compute per-token embeddings using ESM-C or FusOn-pLM and save to disk."""
+"""Compute embeddings using ESM-C or FusOn-pLM and save mean-pooled vectors."""
 
 import argparse
 from pathlib import Path
+import sys
 
 import pandas as pd
 import torch
@@ -10,8 +11,14 @@ import torch
 MAX_SEQ_LEN = 4000
 
 DEFAULT_INPUT = "/homes/gcapitani/driver-fusions/clustering/clustered_splits.csv"
-DEFAULT_OUTPUT = "/homes/gcapitani/driver-fusions/embeddings"
+DEFAULT_OUTPUT = "/work/H2020DeciderFicarra/gcapitani/driver-fusion/embeddings"
 DEFAULT_BENCHMARK = "/homes/gcapitani/driver-fusions/data/benchmark_fusions.csv"
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 def load_esmc(device):
     from esm.models.esmc import ESMC
@@ -46,8 +53,17 @@ def embed_fuson(model_tok, seq, device):
     return out.last_hidden_state.squeeze(0)[1:-1, :].cpu()
 
 
+def mean_pool_embedding(emb: torch.Tensor) -> torch.Tensor:
+    """Return one vector per sequence (mean over token dimension when needed)."""
+    if emb.ndim == 2:
+        return emb.mean(dim=0)
+    if emb.ndim == 1:
+        return emb
+    raise ValueError(f"Unexpected embedding shape {tuple(emb.shape)}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Compute per-token embeddings")
+    parser = argparse.ArgumentParser(description="Compute and save mean-pooled embeddings")
     parser.add_argument("--input", default=DEFAULT_INPUT,
                         help="Clustered CSV with reconstructed_seq, driver, split")
     parser.add_argument("--model", default="esmc", choices=["esmc", "fuson"])
@@ -92,7 +108,7 @@ def main():
         metadata_rows = []
         for i, row in split_df.iterrows():
             emb = embed_fn(row["reconstructed_seq"])
-            embeddings.append(emb)
+            embeddings.append(mean_pool_embedding(emb))
             labels.append(label_map.get(row["driver"], -1))
             cancer_types.append(row.get("Cancertype", ""))
             fusion_pairs.append(f"{row['H_gene']}-{row['T_gene']}")
@@ -127,7 +143,7 @@ def main():
         bm_fusion_pairs = []
         for i, row in bm_df.iterrows():
             emb = embed_fn(row["sequence"])
-            bm_embeddings.append(emb)
+            bm_embeddings.append(mean_pool_embedding(emb))
             bm_labels.append(label_map.get(str(row["driver"]).strip(), 1))
             bm_fusion_pairs.append(
                 f"{row['fusion_h_gene']}-{row['fusion_t_gene']}"

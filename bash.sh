@@ -1,0 +1,1 @@
+srun -Q --immediate=100 -wailb-login-03 --cpus-per-task=1 --mem=16G --account=debiasing --partition=all_serial --gres=gpu:1 --time 4:00:00 --pty bash

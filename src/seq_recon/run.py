@@ -29,6 +29,12 @@ from datetime import datetime
 from pathlib import Path
 import pandas as pd
 
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 # Add parent directory to path to find seq_reconstruction package
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
