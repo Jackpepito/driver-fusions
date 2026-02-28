@@ -12,4 +12,4 @@
 
 # L'indice dell'array viene usato come valore per --layer
 export PYTHONUNBUFFERED=1
-srun python src/train_probe.py --config configs/train_probe_fuson.yaml
+srun python src/train_probe.py --config configs/train_probe_esmc.yaml --focal-gamma 3.0 --lr 1e-2

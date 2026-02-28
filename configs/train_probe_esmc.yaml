@@ -6,7 +6,7 @@ pool: mean
 run_id: ""
 
 epochs: 15000
-batch_size: 64
+batch_size: 32
 lr: 1.0e-4
 patience: 1000
 lr_scheduler: plateau
@@ -20,4 +20,4 @@ probe_hidden_dims: ""
 probe_dropout: 0.2
 
 train_noise_std: 0.0
-focal_gamma: 2.0
+focal_gamma: 3.0
