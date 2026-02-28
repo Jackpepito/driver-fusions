@@ -1,0 +1,23 @@
+embeddings_dir: /work/H2020DeciderFicarra/gcapitani/driver-fusion/embeddings
+output_dir: /work/H2020DeciderFicarra/gcapitani/driver-fusion/results
+
+model: esmc
+pool: mean
+run_id: ""
+
+epochs: 15000
+batch_size: 64
+lr: 1.0e-4
+patience: 1000
+lr_scheduler: plateau
+lr_reduce_factor: 0.5
+lr_min: 1.0e-7
+
+seed: 42
+
+probe_arch: linear
+probe_hidden_dims: ""
+probe_dropout: 0.2
+
+train_noise_std: 0.0
+focal_gamma: 2.0
