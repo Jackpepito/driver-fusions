@@ -132,6 +132,41 @@ def format_benchmark_per_fusion_results(
     return "\n".join(lines)
 
 
+def format_benchmark_per_fusion_results_multi(
+    labels: np.ndarray,
+    fusion_pairs: list[str],
+    preds_by_method: dict[str, np.ndarray],
+    title: str = "BENCHMARK PER-FUSION BREAKDOWN (LINEAR PROBE VS BASELINES)",
+) -> str:
+    labels = np.array(labels)
+    fusions = np.array(fusion_pairs, dtype=object)
+    benchmark_names = sorted({f"{g1}-{g2}" for g1, g2 in BENCHMARK_GENE_PAIRS})
+    lines = [
+        f"{'='*60}",
+        title,
+        f"{'='*60}",
+        "fusion_pair,method,n,pred_driver,pred_non_driver,correct,accuracy",
+    ]
+
+    for name in benchmark_names:
+        mask = fusions == name
+        n = int(mask.sum())
+        if n == 0:
+            for method in preds_by_method:
+                lines.append(f"{name},{method},0,0,0,0,N/A")
+            continue
+        for method, preds in preds_by_method.items():
+            method_preds = np.array(preds)
+            pred_driver = int((method_preds[mask] == 1).sum())
+            pred_non_driver = n - pred_driver
+            correct = int((method_preds[mask] == labels[mask]).sum())
+            accuracy = float(correct / n)
+            lines.append(
+                f"{name},{method},{n},{pred_driver},{pred_non_driver},{correct},{accuracy:.4f}"
+            )
+    return "\n".join(lines)
+
+
 def format_experiment_config(args, device: str, emb_dir: Path, out_dir: Path, run_id: str,
                              dim: int, n_train: int, n_val: int, n_test: int) -> str:
     loss_name = "cross_entropy" if args.focal_gamma == 0 else f"focal_loss(gamma={args.focal_gamma})"
@@ -309,6 +344,109 @@ def _compute_random_baseline(labels: np.ndarray, seed: int = 42) -> tuple[np.nda
     rng = np.random.default_rng(seed)
     y_rand = (rng.random(len(labels)) < p_driver).astype(int)
     return y_rand, p_driver
+
+
+def _normalize_gene_name(v) -> str:
+    s = str(v).strip()
+    if s.lower() in {"", "nan", "none", ".", "na", "n/a"}:
+        return ""
+    return s.upper()
+
+
+def _extract_gene_pair_from_row(row: pd.Series) -> tuple[str, str]:
+    h_gene = ""
+    t_gene = ""
+    if "H_gene" in row.index:
+        h_gene = _normalize_gene_name(row.get("H_gene", ""))
+    if "T_gene" in row.index:
+        t_gene = _normalize_gene_name(row.get("T_gene", ""))
+
+    if (not h_gene or not t_gene) and "fusion_pair" in row.index:
+        pair = str(row.get("fusion_pair", "")).strip()
+        if "-" in pair:
+            parts = pair.split("-", 1)
+            if len(parts) == 2:
+                if not h_gene:
+                    h_gene = _normalize_gene_name(parts[0])
+                if not t_gene:
+                    t_gene = _normalize_gene_name(parts[1])
+    return h_gene, t_gene
+
+
+def _build_gene_frequency_baseline(meta_train: dict) -> tuple[dict[str, dict[str, int]], pd.DataFrame]:
+    rows = meta_train.get("metadata_rows") if isinstance(meta_train, dict) else None
+    if not rows:
+        return {}, pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return {}, pd.DataFrame()
+
+    if "driver" not in df.columns:
+        return {}, pd.DataFrame()
+
+    label_str = df["driver"].astype(str).str.strip().str.lower()
+    known = label_str.isin({"driver", "non-driver"})
+    df = df.loc[known].copy()
+    if df.empty:
+        return {}, pd.DataFrame()
+    df["y_train"] = np.where(label_str.loc[df.index] == "driver", 1, 0)
+
+    gene_counts: dict[str, dict[str, int]] = {}
+    for _, row in df.iterrows():
+        h_gene, t_gene = _extract_gene_pair_from_row(row)
+        y = int(row["y_train"])
+        for g in (h_gene, t_gene):
+            if not g:
+                continue
+            if g not in gene_counts:
+                gene_counts[g] = {"driver": 0, "non_driver": 0}
+            if y == 1:
+                gene_counts[g]["driver"] += 1
+            else:
+                gene_counts[g]["non_driver"] += 1
+
+    if not gene_counts:
+        return {}, pd.DataFrame()
+
+    stats_rows = []
+    for gene, cnt in gene_counts.items():
+        n_driver = int(cnt["driver"])
+        n_non = int(cnt["non_driver"])
+        stats_rows.append(
+            {
+                "gene": gene,
+                "n_driver": n_driver,
+                "n_non_driver": n_non,
+                "total": n_driver + n_non,
+                "driver_minus_non_driver": n_driver - n_non,
+                "prefer_driver": int(n_driver > n_non),
+            }
+        )
+    stats_df = pd.DataFrame(stats_rows).sort_values(
+        ["driver_minus_non_driver", "total", "gene"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+    return gene_counts, stats_df
+
+
+def _predict_gene_frequency_baseline(df_test: pd.DataFrame, gene_counts: dict[str, dict[str, int]]) -> np.ndarray:
+    if len(df_test) == 0:
+        return np.array([], dtype=int)
+    if not gene_counts:
+        return np.zeros(len(df_test), dtype=int)
+
+    preds = np.zeros(len(df_test), dtype=int)
+    for i, (_, row) in enumerate(df_test.iterrows()):
+        h_gene, t_gene = _extract_gene_pair_from_row(row)
+        h_pref = False
+        t_pref = False
+        if h_gene in gene_counts:
+            h_pref = gene_counts[h_gene]["driver"] > gene_counts[h_gene]["non_driver"]
+        if t_gene in gene_counts:
+            t_pref = gene_counts[t_gene]["driver"] > gene_counts[t_gene]["non_driver"]
+        preds[i] = 1 if (h_pref or t_pref) else 0
+    return preds
 
 
 def _baseline_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
@@ -542,22 +680,39 @@ def _rate_by_category_summary_lines(
     tmp = df.copy()
     c = tmp[category_col].astype(str).str.strip()
     tmp[category_col] = c.where(~c.str.lower().isin({"", "nan", "none", "."}), np.nan)
-    tmp = tmp.dropna(subset=[category_col, "y_true", "y_pred", "y_pred_random"])
+    required = [category_col, "y_true", "y_pred", "y_pred_random"]
+    has_gene = "y_pred_gene_baseline" in tmp.columns
+    if has_gene:
+        required.append("y_pred_gene_baseline")
+    tmp = tmp.dropna(subset=required)
     lines = [title, f"category_col: {category_col}", f"n_valid: {len(tmp)}", ""]
     if len(tmp) < 20 or tmp[category_col].nunique() < 2:
         lines.append("Not enough data to compute category rates.")
         return lines
+    agg_map = {
+        "n": ("y_true", "size"),
+        "true_driver_rate": ("y_true", "mean"),
+        "pred_driver_rate": ("y_pred", "mean"),
+        "random_driver_rate": ("y_pred_random", "mean"),
+    }
+    if has_gene:
+        agg_map["gene_baseline_driver_rate"] = ("y_pred_gene_baseline", "mean")
     stats = tmp.groupby(category_col, dropna=False).agg(
-        n=("y_true", "size"),
-        true_driver_rate=("y_true", "mean"),
-        pred_driver_rate=("y_pred", "mean"),
-        random_driver_rate=("y_pred_random", "mean"),
+        **agg_map
     ).reset_index().sort_values("n", ascending=False).head(top_n)
-    lines.append("category,n,true_driver_rate,pred_driver_rate,random_driver_rate")
+    if has_gene:
+        lines.append("category,n,true_driver_rate,pred_driver_rate,random_driver_rate,gene_baseline_driver_rate")
+    else:
+        lines.append("category,n,true_driver_rate,pred_driver_rate,random_driver_rate")
     for _, r in stats.iterrows():
-        lines.append(
-            f"{r[category_col]},{int(r['n'])},{float(r['true_driver_rate']):.6f},{float(r['pred_driver_rate']):.6f},{float(r['random_driver_rate']):.6f}"
-        )
+        if has_gene:
+            lines.append(
+                f"{r[category_col]},{int(r['n'])},{float(r['true_driver_rate']):.6f},{float(r['pred_driver_rate']):.6f},{float(r['random_driver_rate']):.6f},{float(r['gene_baseline_driver_rate']):.6f}"
+            )
+        else:
+            lines.append(
+                f"{r[category_col]},{int(r['n'])},{float(r['true_driver_rate']):.6f},{float(r['pred_driver_rate']):.6f},{float(r['random_driver_rate']):.6f}"
+            )
     return lines
 
 
@@ -661,28 +816,48 @@ def _plot_rate_by_category(
     tmp = df.copy()
     c = tmp[category_col].astype(str).str.strip()
     tmp[category_col] = c.where(~c.str.lower().isin({"", "nan", "none", "."}), np.nan)
-    tmp = tmp.dropna(subset=[category_col, "y_true", "y_pred", "y_pred_random"])
+    required = [category_col, "y_true", "y_pred", "y_pred_random"]
+    has_gene = "y_pred_gene_baseline" in tmp.columns
+    if has_gene:
+        required.append("y_pred_gene_baseline")
+    tmp = tmp.dropna(subset=required)
     if len(tmp) < 20:
         return None
     nun = tmp[category_col].nunique()
     if nun < 2:
         return None
 
+    agg_map = {
+        "n": ("y_true", "size"),
+        "true_driver_rate": ("y_true", "mean"),
+        "pred_driver_rate": ("y_pred", "mean"),
+        "random_driver_rate": ("y_pred_random", "mean"),
+    }
+    if has_gene:
+        agg_map["gene_baseline_driver_rate"] = ("y_pred_gene_baseline", "mean")
     stats = tmp.groupby(category_col, dropna=False).agg(
-        n=("y_true", "size"),
-        true_driver_rate=("y_true", "mean"),
-        pred_driver_rate=("y_pred", "mean"),
-        random_driver_rate=("y_pred_random", "mean"),
+        **agg_map
     ).reset_index().sort_values("n", ascending=False).head(top_n)
+
+    plot_specs = [
+        ("true_driver_rate", "true", "#4c72b0"),
+        ("pred_driver_rate", "predicted", "#dd5555"),
+        ("random_driver_rate", "random baseline", "#999999"),
+    ]
+    if has_gene:
+        plot_specs.append(("gene_baseline_driver_rate", "gene baseline", "#55a868"))
+
+    n_bars = len(plot_specs)
+    h = 0.18 if n_bars >= 4 else 0.24
+    offsets = np.linspace(-(n_bars - 1) * h / 2, (n_bars - 1) * h / 2, n_bars)
+    fig_h = max(6, 0.34 * len(stats))
 
     stats = stats.sort_values("n", ascending=True)
     y = np.arange(len(stats))
-    h = 0.24
 
-    fig, ax = plt.subplots(figsize=(11, max(6, 0.34 * len(stats))))
-    ax.barh(y - h, stats["true_driver_rate"].values, height=h, color="#4c72b0", label="true")
-    ax.barh(y, stats["pred_driver_rate"].values, height=h, color="#dd5555", label="predicted")
-    ax.barh(y + h, stats["random_driver_rate"].values, height=h, color="#999999", label="random baseline")
+    fig, ax = plt.subplots(figsize=(11, fig_h))
+    for off, (col, label, color) in zip(offsets, plot_specs):
+        ax.barh(y + off, stats[col].values, height=h, color=color, label=label)
     ax.set_yticks(y, labels=stats[category_col].astype(str).tolist())
     ax.set_xlim(0, 1)
     ax.set_xlabel("Driver rate")
@@ -705,24 +880,28 @@ def _plot_recurrent_by_label_source(
     if valid.sum() < 30:
         return None
 
-    tmp = df.loc[valid, ["y_true", "y_pred", "y_pred_random"]].copy()
+    source_cols = [("True labels", "y_true"), ("Predicted labels", "y_pred"), ("Random baseline", "y_pred_random")]
+    if "y_pred_gene_baseline" in df.columns:
+        source_cols.append(("Gene baseline", "y_pred_gene_baseline"))
+
+    tmp_keep = [col for _, col in source_cols]
+    tmp = df.loc[valid, tmp_keep].copy()
     tmp["recurrent"] = rec[valid].values
 
-    sources = [("True labels", "y_true"), ("Predicted labels", "y_pred"), ("Random baseline", "y_pred_random")]
     values_drv = []
     values_non = []
-    for _, col in sources:
+    for _, col in source_cols:
         d = tmp.loc[tmp[col] == 1, "recurrent"]
         n = tmp.loc[tmp[col] == 0, "recurrent"]
         values_drv.append(float(d.mean()) if len(d) else np.nan)
         values_non.append(float(n.mean()) if len(n) else np.nan)
 
-    x = np.arange(len(sources))
+    x = np.arange(len(source_cols))
     w = 0.36
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(max(9, 2.2 * len(source_cols)), 5))
     ax.bar(x - w / 2, values_non, width=w, color="#4c72b0", label="non-driver")
     ax.bar(x + w / 2, values_drv, width=w, color="#dd5555", label="driver")
-    ax.set_xticks(x, [s[0] for s in sources])
+    ax.set_xticks(x, [s[0] for s in source_cols])
     ax.set_ylim(0, 1)
     ax.set_ylabel("Recurrent fusion rate")
     ax.set_title("Recurrent fusions by label source")
@@ -734,33 +913,85 @@ def _plot_recurrent_by_label_source(
     return out_path
 
 
-def _plot_model_vs_random_metrics(
+def _plot_model_vs_baselines_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     y_rand: np.ndarray,
+    y_gene: np.ndarray,
     out_path: Path,
-) -> tuple[Path, dict, dict]:
+) -> tuple[Path, dict, dict, dict]:
     m_model = _baseline_metrics(y_true, y_pred)
     m_rand = _baseline_metrics(y_true, y_rand)
+    m_gene = _baseline_metrics(y_true, y_gene)
 
     keys = ["accuracy", "f1", "precision", "recall", "predicted_driver_rate"]
     labels = ["Accuracy", "F1", "Precision", "Recall", "Driver rate"]
     x = np.arange(len(keys))
-    w = 0.36
+    w = 0.25
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.bar(x - w / 2, [m_model[k] for k in keys], width=w, color="#dd5555", label="model")
-    ax.bar(x + w / 2, [m_rand[k] for k in keys], width=w, color="#999999", label="random baseline")
+    ax.bar(x - w, [m_model[k] for k in keys], width=w, color="#dd5555", label="linear probe")
+    ax.bar(x, [m_rand[k] for k in keys], width=w, color="#999999", label="random baseline")
+    ax.bar(x + w, [m_gene[k] for k in keys], width=w, color="#55a868", label="gene-frequency baseline")
     ax.set_xticks(x, labels)
     ax.set_ylim(0, 1)
     ax.set_ylabel("Score")
-    ax.set_title("Model vs random-choice baseline")
+    ax.set_title("Linear probe vs baselines")
     ax.grid(axis="y", alpha=0.25, linestyle="--", linewidth=0.6)
     ax.legend()
     fig.tight_layout()
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
-    return out_path, m_model, m_rand
+    return out_path, m_model, m_rand, m_gene
+
+
+def _plot_benchmark_per_fusion_accuracy(
+    labels: np.ndarray,
+    fusion_pairs: list[str],
+    preds_by_method: dict[str, np.ndarray],
+    out_path: Path,
+) -> Path | None:
+    labels = np.array(labels)
+    fusions = np.array(fusion_pairs, dtype=object)
+    benchmark_names = sorted({f"{g1}-{g2}" for g1, g2 in BENCHMARK_GENE_PAIRS})
+    rows = []
+    for pair in benchmark_names:
+        mask = fusions == pair
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        for method, preds in preds_by_method.items():
+            p = np.array(preds)
+            acc = float((p[mask] == labels[mask]).mean())
+            rows.append({"fusion_pair": pair, "method": method, "accuracy": acc, "n": n})
+
+    if not rows:
+        return None
+
+    df_plot = pd.DataFrame(rows)
+    pairs_present = df_plot["fusion_pair"].drop_duplicates().tolist()
+    methods = list(preds_by_method.keys())
+    x = np.arange(len(pairs_present))
+    w = min(0.26, 0.75 / max(1, len(methods)))
+
+    fig, ax = plt.subplots(figsize=(max(8, 2.2 * len(pairs_present)), 5))
+    for i, method in enumerate(methods):
+        vals = []
+        for pair in pairs_present:
+            s = df_plot[(df_plot["fusion_pair"] == pair) & (df_plot["method"] == method)]["accuracy"]
+            vals.append(float(s.iloc[0]) if len(s) else np.nan)
+        ax.bar(x + (i - (len(methods) - 1) / 2) * w, vals, width=w, label=method)
+
+    ax.set_xticks(x, pairs_present)
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("Accuracy")
+    ax.set_title("Benchmark per-fusion accuracy: linear probe vs baselines")
+    ax.grid(axis="y", alpha=0.25, linestyle="--", linewidth=0.6)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+    return out_path
 
 
 def _plot_gene_role_distribution_true_labels(
@@ -866,6 +1097,7 @@ def analyze_test_predictions(
     metrics: dict,
     out_dir: Path,
     train_fusion_names: set[str] | None = None,
+    meta_train: dict | None = None,
 ) -> dict:
     """Analyze test-set predictions by metadata and save analysis artifacts."""
     preds = np.array(metrics["preds"])
@@ -889,9 +1121,17 @@ def analyze_test_predictions(
     df["is_correct"] = (df["y_pred"] == df["y_true"]).astype(int)
     y_rand, p_driver = _compute_random_baseline(labels, seed=42)
     df["y_pred_random"] = y_rand
+    gene_counts, gene_stats_df = _build_gene_frequency_baseline(meta_train or {})
+    y_gene = _predict_gene_frequency_baseline(df, gene_counts)
+    df["y_pred_gene_baseline"] = y_gene
 
     pred_csv = out_dir / "test_predictions_with_metadata.csv"
     df.to_csv(pred_csv, index=False)
+
+    gene_baseline_csv = None
+    if not gene_stats_df.empty:
+        gene_baseline_csv = out_dir / "gene_frequency_baseline_train_stats.csv"
+        gene_stats_df.to_csv(gene_baseline_csv, index=False)
 
     # ── Cancer type breakdown ────────────────────────────────────────────
     cancer_csv = None
@@ -1006,7 +1246,7 @@ def analyze_test_predictions(
 
     # ── Generic numeric feature associations (predicted driver vs non-driver) ──
     numeric_rows = []
-    excluded = {"y_true", "y_pred", "y_prob_driver", "is_correct"}
+    excluded = {"y_true", "y_pred", "y_prob_driver", "is_correct", "y_pred_random", "y_pred_gene_baseline"}
     for col in df.columns:
         if col in excluded:
             continue
@@ -1121,18 +1361,19 @@ def analyze_test_predictions(
             )
         _write_text_lines(txt, lines)
         plot_txt_paths.append(txt)
-    plot_baseline, baseline_model, baseline_random = _plot_model_vs_random_metrics(
-        labels, preds, y_rand, out_dir / "plot_model_vs_random_baseline.png"
+    plot_baseline, baseline_model, baseline_random, baseline_gene = _plot_model_vs_baselines_metrics(
+        labels, preds, y_rand, y_gene, out_dir / "plot_model_vs_baselines.png"
     )
     if plot_baseline is not None:
         txt = _plot_txt_path(plot_baseline)
         _write_text_lines(
             txt,
             [
-                "Model vs random-choice baseline summary",
+                "Linear probe vs baselines summary",
                 f"random_reference_driver_rate={p_driver:.6f}",
                 f"model: accuracy={baseline_model['accuracy']:.6f}, f1={baseline_model['f1']:.6f}, precision={baseline_model['precision']:.6f}, recall={baseline_model['recall']:.6f}, predicted_driver_rate={baseline_model['predicted_driver_rate']:.6f}",
                 f"random: accuracy={baseline_random['accuracy']:.6f}, f1={baseline_random['f1']:.6f}, precision={baseline_random['precision']:.6f}, recall={baseline_random['recall']:.6f}, predicted_driver_rate={baseline_random['predicted_driver_rate']:.6f}",
+                f"gene_frequency: accuracy={baseline_gene['accuracy']:.6f}, f1={baseline_gene['f1']:.6f}, precision={baseline_gene['precision']:.6f}, recall={baseline_gene['recall']:.6f}, predicted_driver_rate={baseline_gene['predicted_driver_rate']:.6f}",
             ],
         )
         plot_txt_paths.append(txt)
@@ -1173,10 +1414,15 @@ def analyze_test_predictions(
             rec = _to_binary(df[recurrent_col])
             valid = rec.notna()
             tmp_rec = df.loc[valid, ["y_true", "y_pred", "y_pred_random"]].copy()
+            if "y_pred_gene_baseline" in df.columns:
+                tmp_rec["y_pred_gene_baseline"] = df.loc[valid, "y_pred_gene_baseline"].values
             tmp_rec["recurrent"] = rec[valid].values
             txt = _plot_txt_path(plot_recurrent)
             lines = ["Recurrent fusion rate summary", "source,non_driver_rate,driver_rate"]
-            for name, col in [("true", "y_true"), ("predicted", "y_pred"), ("random", "y_pred_random")]:
+            source_cols = [("true", "y_true"), ("predicted", "y_pred"), ("random", "y_pred_random")]
+            if "y_pred_gene_baseline" in tmp_rec.columns:
+                source_cols.append(("gene_baseline", "y_pred_gene_baseline"))
+            for name, col in source_cols:
                 non = tmp_rec.loc[tmp_rec[col] == 0, "recurrent"]
                 drv = tmp_rec.loc[tmp_rec[col] == 1, "recurrent"]
                 lines.append(
@@ -1191,7 +1437,7 @@ def analyze_test_predictions(
             df,
             cancer_col,
             out_dir / "plot_cancer_type_true_pred_random.png",
-            title="Driver-rate by cancer type (true vs predicted vs random)",
+            title="Driver-rate by cancer type (true vs predicted vs random vs gene baseline)",
             top_n=20,
         )
         if plot_cancer_rates is not None:
@@ -1201,7 +1447,7 @@ def analyze_test_predictions(
                 _rate_by_category_summary_lines(
                     df,
                     cancer_col,
-                    "Driver-rate by cancer type (true vs predicted vs random)",
+                    "Driver-rate by cancer type (true vs predicted vs random vs gene baseline)",
                     top_n=20,
                 ),
             )
@@ -1222,7 +1468,7 @@ def analyze_test_predictions(
             tmp,
             "role_status",
             out_path,
-            title=f"Driver-rate by {role_col} (true vs predicted vs random)",
+            title=f"Driver-rate by {role_col} (true vs predicted vs random vs gene baseline)",
             top_n=2,
         )
         if p is not None:
@@ -1233,7 +1479,7 @@ def analyze_test_predictions(
                 _rate_by_category_summary_lines(
                     tmp,
                     "role_status",
-                    f"Driver-rate by {role_col} (true vs predicted vs random)",
+                    f"Driver-rate by {role_col} (true vs predicted vs random vs gene baseline)",
                     top_n=2,
                 ),
             )
@@ -1245,7 +1491,7 @@ def analyze_test_predictions(
             df,
             chr_info_col,
             out_dir / "plot_chr_info_true_pred_random.png",
-            title="Driver-rate by Chr_info (true vs predicted vs random)",
+            title="Driver-rate by Chr_info (true vs predicted vs random vs gene baseline)",
             top_n=15,
         )
         if plot_chr_info is not None:
@@ -1255,7 +1501,7 @@ def analyze_test_predictions(
                 _rate_by_category_summary_lines(
                     df,
                     chr_info_col,
-                    "Driver-rate by Chr_info (true vs predicted vs random)",
+                    "Driver-rate by Chr_info (true vs predicted vs random vs gene baseline)",
                     top_n=15,
                 ),
             )
@@ -1273,7 +1519,7 @@ def analyze_test_predictions(
             tmp,
             "has_pub_status",
             out_dir / "plot_has_pub_true_pred_random.png",
-            title="Driver-rate by has_pub (true vs predicted vs random)",
+            title="Driver-rate by has_pub (true vs predicted vs random vs gene baseline)",
             top_n=2,
         )
         if plot_has_pub is not None:
@@ -1283,7 +1529,7 @@ def analyze_test_predictions(
                 _rate_by_category_summary_lines(
                     tmp,
                     "has_pub_status",
-                    "Driver-rate by has_pub (true vs predicted vs random)",
+                    "Driver-rate by has_pub (true vs predicted vs random vs gene baseline)",
                     top_n=2,
                 ),
             )
@@ -1312,6 +1558,8 @@ def analyze_test_predictions(
 
     top_num = numeric_df.head(8) if len(numeric_df) else pd.DataFrame()
     top_cat = cat_df.head(8) if len(cat_df) else pd.DataFrame()
+    cm_random = confusion_matrix(labels, y_rand)
+    cm_gene = confusion_matrix(labels, y_gene)
 
     return {
         "pred_csv": pred_csv,
@@ -1339,8 +1587,12 @@ def analyze_test_predictions(
         "plot_text_summaries": plot_txt_paths,
         "top_driver_prob": top_driver_prob,
         "top_non_driver_prob": top_non_driver_prob,
+        "gene_baseline_train_csv": gene_baseline_csv,
         "baseline_model": baseline_model,
         "baseline_random": baseline_random,
+        "baseline_gene": baseline_gene,
+        "baseline_random_confusion_matrix": cm_random,
+        "baseline_gene_confusion_matrix": cm_gene,
         "baseline_random_driver_rate_reference": p_driver,
         "top_numeric": top_num,
         "top_categorical": top_cat,
@@ -1545,7 +1797,20 @@ def main():
         print_per_fusion_results(t_last["preds"], t_last["labels"], meta_test["fusion_pairs"])
 
     # Benchmark evaluation — load pre-computed benchmark embeddings
+    gene_counts_train, _ = _build_gene_frequency_baseline(meta_train)
     bm_pt = emb_dir / "benchmark.pt"
+    bm_artifacts = {
+        "metrics_plot": None,
+        "metrics_txt": None,
+        "per_fusion_plot": None,
+        "per_fusion_txt": None,
+        "metrics_model": None,
+        "metrics_random": None,
+        "metrics_gene": None,
+        "cm_random": None,
+        "cm_gene": None,
+        "random_ref_driver_rate": None,
+    }
     if bm_pt.exists():
         X_bm, y_bm, meta_bm = load_embeddings(emb_dir, "benchmark", args.pool)
         bm_pairs = meta_bm.get("fusion_pairs", [])
@@ -1565,6 +1830,77 @@ def main():
         print_test_results(bm_last, f"{args.model} [benchmark]", args.pool)
         if bm_pairs:
             print_per_fusion_results(bm_last["preds"], bm_last["labels"], bm_pairs)
+
+        # baseline comparison on benchmark
+        bm_labels = np.array(bm_best["labels"])
+        bm_preds_model = np.array(bm_best["preds"])
+        bm_rand, bm_p_driver = _compute_random_baseline(bm_labels, seed=42)
+        if bm_pairs and len(bm_pairs) == len(bm_labels):
+            bm_df = pd.DataFrame({"fusion_pair": bm_pairs})
+        else:
+            bm_df = pd.DataFrame({"fusion_pair": [""] * len(bm_labels)})
+        bm_gene = _predict_gene_frequency_baseline(bm_df, gene_counts_train)
+
+        bm_metrics_plot, bm_m_model, bm_m_rand, bm_m_gene = _plot_model_vs_baselines_metrics(
+            bm_labels,
+            bm_preds_model,
+            bm_rand,
+            bm_gene,
+            out_dir / "plot_benchmark_model_vs_baselines.png",
+        )
+        bm_metrics_txt = _plot_txt_path(bm_metrics_plot)
+        _write_text_lines(
+            bm_metrics_txt,
+            [
+                "Benchmark linear probe vs baselines summary",
+                f"random_reference_driver_rate={bm_p_driver:.6f}",
+                f"linear_probe: accuracy={bm_m_model['accuracy']:.6f}, f1={bm_m_model['f1']:.6f}, precision={bm_m_model['precision']:.6f}, recall={bm_m_model['recall']:.6f}, predicted_driver_rate={bm_m_model['predicted_driver_rate']:.6f}",
+                f"random: accuracy={bm_m_rand['accuracy']:.6f}, f1={bm_m_rand['f1']:.6f}, precision={bm_m_rand['precision']:.6f}, recall={bm_m_rand['recall']:.6f}, predicted_driver_rate={bm_m_rand['predicted_driver_rate']:.6f}",
+                f"gene_frequency: accuracy={bm_m_gene['accuracy']:.6f}, f1={bm_m_gene['f1']:.6f}, precision={bm_m_gene['precision']:.6f}, recall={bm_m_gene['recall']:.6f}, predicted_driver_rate={bm_m_gene['predicted_driver_rate']:.6f}",
+            ],
+        )
+
+        bm_artifacts.update(
+            {
+                "metrics_plot": bm_metrics_plot,
+                "metrics_txt": bm_metrics_txt,
+                "metrics_model": bm_m_model,
+                "metrics_random": bm_m_rand,
+                "metrics_gene": bm_m_gene,
+                "cm_random": confusion_matrix(bm_labels, bm_rand),
+                "cm_gene": confusion_matrix(bm_labels, bm_gene),
+                "random_ref_driver_rate": bm_p_driver,
+            }
+        )
+
+        if bm_pairs:
+            preds_by_method = {
+                "linear_probe": bm_preds_model,
+                "random": bm_rand,
+                "gene_frequency": bm_gene,
+            }
+            bm_per_fusion_plot = _plot_benchmark_per_fusion_accuracy(
+                bm_labels,
+                bm_pairs,
+                preds_by_method,
+                out_dir / "plot_benchmark_per_fusion_accuracy_baselines.png",
+            )
+            bm_per_fusion_txt = out_dir / "benchmark_per_fusion_baselines.txt"
+            bm_per_fusion_txt.write_text(
+                format_benchmark_per_fusion_results_multi(
+                    labels=bm_labels,
+                    fusion_pairs=bm_pairs,
+                    preds_by_method=preds_by_method,
+                    title="BENCHMARK PER-FUSION BREAKDOWN (LINEAR PROBE VS BASELINES)",
+                ) + "\n",
+                encoding="utf-8",
+            )
+            bm_artifacts.update(
+                {
+                    "per_fusion_plot": bm_per_fusion_plot,
+                    "per_fusion_txt": bm_per_fusion_txt,
+                }
+            )
     else:
         print(f"\n[INFO] No benchmark embeddings found at {bm_pt}. "
               "Run compute_embeddings.py first to generate them.")
@@ -1582,6 +1918,7 @@ def main():
         t_best,
         out_dir,
         train_fusion_names=train_fusion_names,
+        meta_train=meta_train,
     )
     print(f"Test predictions + metadata saved to {analysis_artifacts['pred_csv']}")
     if analysis_artifacts["cancer_csv"] is not None:
@@ -1605,7 +1942,9 @@ def main():
     if analysis_artifacts["plot_categorical"] is not None:
         print(f"Categorical-association plot saved to {analysis_artifacts['plot_categorical']}")
     if analysis_artifacts["plot_baseline"] is not None:
-        print(f"Model-vs-random baseline plot saved to {analysis_artifacts['plot_baseline']}")
+        print(f"Linear-probe-vs-baselines plot saved to {analysis_artifacts['plot_baseline']}")
+    if analysis_artifacts["gene_baseline_train_csv"] is not None:
+        print(f"Gene-frequency baseline train stats saved to {analysis_artifacts['gene_baseline_train_csv']}")
     if analysis_artifacts["plot_seed_reads"] is not None:
         print(f"Seed-reads plot saved to {analysis_artifacts['plot_seed_reads']}")
     if analysis_artifacts["plot_junction_reads"] is not None:
@@ -1613,7 +1952,7 @@ def main():
     if analysis_artifacts["plot_recurrent"] is not None:
         print(f"Recurrent-rate plot saved to {analysis_artifacts['plot_recurrent']}")
     if analysis_artifacts["plot_cancer_rates"] is not None:
-        print(f"Cancer-type rates (true/pred/random) plot saved to {analysis_artifacts['plot_cancer_rates']}")
+        print(f"Cancer-type rates (true/pred/random/gene-baseline) plot saved to {analysis_artifacts['plot_cancer_rates']}")
     if analysis_artifacts["plot_chr_info"] is not None:
         print(f"Chr_info plot saved to {analysis_artifacts['plot_chr_info']}")
     if analysis_artifacts["plot_has_pub"] is not None:
@@ -1628,6 +1967,14 @@ def main():
         print("Plot text summaries saved:")
         for p in analysis_artifacts["plot_text_summaries"]:
             print(f"  - {p}")
+    if bm_artifacts["metrics_plot"] is not None:
+        print(f"Benchmark linear-probe-vs-baselines plot saved to {bm_artifacts['metrics_plot']}")
+    if bm_artifacts["metrics_txt"] is not None:
+        print(f"Benchmark baseline metrics summary saved to {bm_artifacts['metrics_txt']}")
+    if bm_artifacts["per_fusion_plot"] is not None:
+        print(f"Benchmark per-fusion baseline comparison plot saved to {bm_artifacts['per_fusion_plot']}")
+    if bm_artifacts["per_fusion_txt"] is not None:
+        print(f"Benchmark per-fusion baseline comparison table saved to {bm_artifacts['per_fusion_txt']}")
     _print_top_probability_tables(
         "TEST SET: TOP FUSIONS BY P(driver)",
         analysis_artifacts["top_driver_prob"],
@@ -1666,6 +2013,28 @@ def main():
                     bm_best["preds"], bm_best["labels"], bm_pairs
                 ),
             ])
+        if bm_artifacts["metrics_model"] is not None:
+            bmm = bm_artifacts["metrics_model"]
+            bmr = bm_artifacts["metrics_random"]
+            bmg = bm_artifacts["metrics_gene"]
+            bm_cmr = bm_artifacts["cm_random"]
+            bm_cmg = bm_artifacts["cm_gene"]
+            summary_sections.extend([
+                "",
+                "Benchmark baseline comparison (linear probe vs random vs gene-frequency):",
+                f"  - random reference driver rate (from benchmark y_true prevalence): {bm_artifacts['random_ref_driver_rate']:.4f}",
+                f"  - linear probe: acc={bmm['accuracy']:.4f}, f1={bmm['f1']:.4f}, prec={bmm['precision']:.4f}, rec={bmm['recall']:.4f}, pred_driver_rate={bmm['predicted_driver_rate']:.4f}",
+                f"  - random: acc={bmr['accuracy']:.4f}, f1={bmr['f1']:.4f}, prec={bmr['precision']:.4f}, rec={bmr['recall']:.4f}, pred_driver_rate={bmr['predicted_driver_rate']:.4f}",
+                f"  - gene-frequency: acc={bmg['accuracy']:.4f}, f1={bmg['f1']:.4f}, prec={bmg['precision']:.4f}, rec={bmg['recall']:.4f}, pred_driver_rate={bmg['predicted_driver_rate']:.4f}",
+                "  - random confusion matrix:",
+                str(bm_cmr),
+                "  - gene-frequency confusion matrix:",
+                str(bm_cmg),
+                f"  - benchmark metrics plot: {bm_artifacts['metrics_plot']}",
+                f"  - benchmark metrics txt: {bm_artifacts['metrics_txt']}",
+                f"  - benchmark per-fusion plot: {bm_artifacts['per_fusion_plot'] if bm_artifacts['per_fusion_plot'] is not None else 'N/A'}",
+                f"  - benchmark per-fusion table: {bm_artifacts['per_fusion_txt'] if bm_artifacts['per_fusion_txt'] is not None else 'N/A'}",
+            ])
 
     summary_sections.extend([
         "",
@@ -1683,18 +2052,19 @@ def main():
         f"Cancer-type plot: {analysis_artifacts['plot_cancer'] if analysis_artifacts['plot_cancer'] else 'N/A'}",
         f"Numeric associations plot: {analysis_artifacts['plot_numeric'] if analysis_artifacts['plot_numeric'] else 'N/A'}",
         f"Categorical associations plot: {analysis_artifacts['plot_categorical'] if analysis_artifacts['plot_categorical'] else 'N/A'}",
-        f"Model-vs-random baseline plot: {analysis_artifacts['plot_baseline'] if analysis_artifacts['plot_baseline'] else 'N/A'}",
+        f"Linear-probe-vs-baselines plot: {analysis_artifacts['plot_baseline'] if analysis_artifacts['plot_baseline'] else 'N/A'}",
+        f"Gene-frequency baseline train stats: {analysis_artifacts['gene_baseline_train_csv'] if analysis_artifacts['gene_baseline_train_csv'] else 'N/A (missing train metadata)'}",
         f"Seed reads (true vs pred) plot: {analysis_artifacts['plot_seed_reads'] if analysis_artifacts['plot_seed_reads'] else 'N/A'}",
         f"Junction reads (true vs pred) plot: {analysis_artifacts['plot_junction_reads'] if analysis_artifacts['plot_junction_reads'] else 'N/A'}",
         f"Recurrent rate plot: {analysis_artifacts['plot_recurrent'] if analysis_artifacts['plot_recurrent'] else 'N/A'}",
-        f"Cancer type rates (true/pred/random) plot: {analysis_artifacts['plot_cancer_rates'] if analysis_artifacts['plot_cancer_rates'] else 'N/A'}",
+        f"Cancer type rates (true/pred/random/gene-baseline) plot: {analysis_artifacts['plot_cancer_rates'] if analysis_artifacts['plot_cancer_rates'] else 'N/A'}",
         f"Chr_info plot: {analysis_artifacts['plot_chr_info'] if analysis_artifacts['plot_chr_info'] else 'N/A'}",
         f"has_pub plot: {analysis_artifacts['plot_has_pub'] if analysis_artifacts['plot_has_pub'] else 'N/A'}",
         f"Gene-role distribution plot (true labels): {analysis_artifacts['plot_gene_roles'] if analysis_artifacts['plot_gene_roles'] else 'N/A'}",
     ])
 
     role_plot_paths = analysis_artifacts["plot_role_paths"]
-    summary_sections.extend(["", "Role plots (true/pred/random):"])
+    summary_sections.extend(["", "Role plots (true/pred/random/gene-baseline):"])
     if role_plot_paths:
         for p in role_plot_paths:
             summary_sections.append(f"  - {p}")
@@ -1703,12 +2073,20 @@ def main():
 
     bm = analysis_artifacts["baseline_model"]
     br = analysis_artifacts["baseline_random"]
+    bg = analysis_artifacts["baseline_gene"]
+    cmr = analysis_artifacts["baseline_random_confusion_matrix"]
+    cmg = analysis_artifacts["baseline_gene_confusion_matrix"]
     summary_sections.extend([
         "",
-        "Random-choice baseline comparison:",
+        "Baseline comparison (linear probe vs random vs gene-frequency):",
         f"  - random reference driver rate (from y_true prevalence): {analysis_artifacts['baseline_random_driver_rate_reference']:.4f}",
-        f"  - model:  acc={bm['accuracy']:.4f}, f1={bm['f1']:.4f}, prec={bm['precision']:.4f}, rec={bm['recall']:.4f}, pred_driver_rate={bm['predicted_driver_rate']:.4f}",
+        f"  - linear probe: acc={bm['accuracy']:.4f}, f1={bm['f1']:.4f}, prec={bm['precision']:.4f}, rec={bm['recall']:.4f}, pred_driver_rate={bm['predicted_driver_rate']:.4f}",
         f"  - random: acc={br['accuracy']:.4f}, f1={br['f1']:.4f}, prec={br['precision']:.4f}, rec={br['recall']:.4f}, pred_driver_rate={br['predicted_driver_rate']:.4f}",
+        f"  - gene-frequency: acc={bg['accuracy']:.4f}, f1={bg['f1']:.4f}, prec={bg['precision']:.4f}, rec={bg['recall']:.4f}, pred_driver_rate={bg['predicted_driver_rate']:.4f}",
+        "  - random confusion matrix:",
+        str(cmr),
+        "  - gene-frequency confusion matrix:",
+        str(cmg),
     ])
 
     summary_sections.extend(["", "Plot text summaries:"])
