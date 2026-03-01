@@ -1,0 +1,54 @@
+{
+  "workspace_root": "/work/H2020DeciderFicarra/gcapitani",
+  "policies": ["A", "B", "C", "D"],
+  "recon_modes": ["ORF", "Without_ORF"],
+  "models": ["esmc", "fuson"],
+  "data": {
+    "chimerseq_csv": "/homes/gcapitani/Gene-Fusions/data/ChimerSeq4.csv",
+    "census_tsv": "/homes/gcapitani/Gene-Fusions/data/Census_allFri Jun 27 11_25_18 2025.tsv",
+    "benchmark_csv": "/homes/gcapitani/driver-fusions/data/benchmark_fusions.csv",
+    "evaluation_input_csv": "/homes/gcapitani/driver-fusions/fusions_set1_17_results/fusions_set1_17_reconstructed_sequences.csv"
+  },
+  "reconstruction": {
+    "genome_build": "all",
+    "seed": 42,
+    "n_samples": null,
+    "orffinder_path": "/homes/gcapitani/Gene-Fusions/data/ORFfinder"
+  },
+  "clustering": {
+    "min_seq_id": 0.3,
+    "coverage": 0.8,
+    "train_ratio": 0.7,
+    "val_ratio": 0.15,
+    "seed": 42
+  },
+  "training": {
+    "pool": "mean",
+    "epochs": 5000,
+    "patience": 2000,
+    "seed": 42,
+    "probe_arch": ["linear", "deep"],
+    "probe_hidden_dims": "",
+    "probe_dropout": 0.2,
+    "lr_scheduler": "plateau",
+    "lr_reduce_factor": 0.5,
+    "lr_min": 1e-06,
+    "train_probe_config": "",
+    "grid": {
+      "lr": [0.001, 0.0001],
+      "batch_size": [64],
+      "noise": [0.0, 0.01],
+      "focal_gamma": [0.0, 2.0, 4.0]
+    }
+  },
+  "wandb": {
+    "enabled": true,
+    "mode": "online",
+    "project": "driver-fusions-policy-comparison",
+    "entity": "capitani-experiments",
+    "tags": ["A-B-C-D", "orf-vs-noorf", "grid-search"]
+  },
+  "runtime": {
+    "skip_existing": true
+  }
+}

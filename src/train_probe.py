@@ -76,6 +76,8 @@ class FocalLoss(nn.Module):
 def format_test_results(metrics: dict, model_name: str, pool: str, title: str) -> str:
     """Create a text block with the same final test metrics shown in stdout."""
     t = metrics
+    labels = [0, 1]
+    target_names = ["non-driver", "driver"]
     lines = [
         f"{'='*60}",
         title,
@@ -88,9 +90,15 @@ def format_test_results(metrics: dict, model_name: str, pool: str, title: str) -
         f"  Recall:    {t['rec']:.4f}",
         "",
         "Classification report:",
-        classification_report(t["labels"], t["preds"], target_names=["non-driver", "driver"]),
+        classification_report(
+            t["labels"],
+            t["preds"],
+            labels=labels,
+            target_names=target_names,
+            zero_division=0,
+        ),
         "Confusion matrix:",
-        str(confusion_matrix(t["labels"], t["preds"])),
+        str(confusion_matrix(t["labels"], t["preds"], labels=labels)),
     ]
     return "\n".join(lines)
 

@@ -10,6 +10,7 @@ src/analysis/fusions*
 *.csv
 *.tsv
 *.json
+!configs/driver_policies_experiments.json
 *.log
 *.txt
 *.fasta

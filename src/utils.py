@@ -119,12 +119,17 @@ def compute_metrics(model, X: torch.Tensor, y: torch.Tensor, device: str):
     probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
     preds = logits.argmax(dim=1).cpu().numpy()
     y_np = y.numpy()
+    try:
+        auroc = roc_auc_score(y_np, probs)
+    except ValueError:
+        # Happens when a split has a single class.
+        auroc = float("nan")
     return {
         "acc": accuracy_score(y_np, preds),
-        "f1": f1_score(y_np, preds),
-        "auroc": roc_auc_score(y_np, probs),
-        "prec": precision_score(y_np, preds),
-        "rec": recall_score(y_np, preds),
+        "f1": f1_score(y_np, preds, zero_division=0),
+        "auroc": auroc,
+        "prec": precision_score(y_np, preds, zero_division=0),
+        "rec": recall_score(y_np, preds, zero_division=0),
         "preds": preds,
         "probs": probs,
         "labels": y_np,
@@ -186,6 +191,8 @@ def print_per_fusion_results(preds, labels, fusion_pairs):
 
 def print_test_results(metrics: dict, model_name: str, pool: str):
     t = metrics
+    labels = [0, 1]
+    target_names = ["non-driver", "driver"]
     print(f"\n{'='*60}")
     print(f"TEST RESULTS — {model_name.upper()} (pool={pool})")
     print(f"{'='*60}")
@@ -194,8 +201,17 @@ def print_test_results(metrics: dict, model_name: str, pool: str):
     print(f"  AUROC:     {t['auroc']:.4f}")
     print(f"  Precision: {t['prec']:.4f}")
     print(f"  Recall:    {t['rec']:.4f}")
-    print(f"\n{classification_report(t['labels'], t['preds'], target_names=['non-driver', 'driver'])}")
-    print(f"Confusion matrix:\n{confusion_matrix(t['labels'], t['preds'])}")
+    print(
+        "\n"
+        + classification_report(
+            t["labels"],
+            t["preds"],
+            labels=labels,
+            target_names=target_names,
+            zero_division=0,
+        )
+    )
+    print(f"Confusion matrix:\n{confusion_matrix(t['labels'], t['preds'], labels=labels)}")
 
 
 def evaluate_on_benchmark(model, X_test: torch.Tensor, y_test: torch.Tensor,
