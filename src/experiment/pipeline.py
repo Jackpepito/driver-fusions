@@ -102,6 +102,133 @@ def expected_reconstruction_paths(dirs: dict[str, Path], policy: str, recon_mode
     return output_prefix, output_csv
 
 
+def _gene_count_table_for_subset(df_subset):
+    import pandas as pd
+
+    preferred_pairs = [("H_gene", "T_gene"), ("gene5", "gene3")]
+    gene_cols: list[str] = []
+    for c1, c2 in preferred_pairs:
+        if c1 in df_subset.columns and c2 in df_subset.columns:
+            gene_cols = [c1, c2]
+            break
+    if not gene_cols:
+        gene_cols = [c for c in ("H_gene", "T_gene", "gene5", "gene3") if c in df_subset.columns]
+    if not gene_cols:
+        return pd.DataFrame(columns=["gene", "count"])
+
+    parts = []
+    for col in gene_cols:
+        s = df_subset[col].dropna().astype(str).str.strip()
+        s = s[s != ""]
+        parts.append(s)
+    if not parts:
+        return pd.DataFrame(columns=["gene", "count"])
+
+    genes = pd.concat(parts, ignore_index=True)
+    counts = genes.value_counts().rename_axis("gene").reset_index(name="count")
+    return counts
+
+
+def generate_split_gene_distribution_plots(cluster_csv: Path, out_dir: Path, logger, top_n: int = 20) -> dict[str, Path]:
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    df = pd.read_csv(cluster_csv)
+    required = {"split", "driver"}
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        logger.warning("Skipping split gene distribution plots, missing columns in %s: %s", cluster_csv, missing)
+        return {}
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    plot_paths: dict[str, Path] = {}
+
+    class_specs = [("driver", "driver"), ("non_driver", "non-driver")]
+    split_order = [s for s in ("train", "val", "test") if s in set(df["split"].dropna().astype(str))]
+    if not split_order:
+        split_order = sorted(set(df["split"].dropna().astype(str)))
+
+    for split in split_order:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        for idx, (class_slug, class_label) in enumerate(class_specs):
+            ax = axes[idx]
+            subset = df[(df["split"] == split) & (df["driver"] == class_label)]
+            counts = _gene_count_table_for_subset(subset)
+            counts_path = out_dir / f"{split}_{class_slug}_gene_counts.csv"
+            counts.to_csv(counts_path, index=False)
+
+            if counts.empty:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+                ax.set_axis_off()
+                ax.set_title(f"{split} | {class_label} (n=0)")
+                continue
+
+            top = counts.head(top_n).iloc[::-1]
+            ax.barh(top["gene"], top["count"])
+            ax.set_xlabel("Occurrences")
+            ax.set_ylabel("Gene")
+            ax.set_title(f"{split} | {class_label} (rows={len(subset)})")
+
+        fig.suptitle(f"Gene Distribution by Class — Split: {split}", fontsize=14)
+        fig.tight_layout()
+        plot_path = out_dir / f"{split}_gene_distribution_by_class.png"
+        fig.savefig(plot_path, dpi=200)
+        plt.close(fig)
+        plot_paths[split] = plot_path
+
+    return plot_paths
+
+
+def maybe_log_split_gene_plots_to_wandb(
+    policy: str,
+    recon_mode: str,
+    plot_paths: dict[str, Path],
+    config: dict[str, Any],
+    logger,
+) -> None:
+    if not plot_paths:
+        return
+
+    wandb_cfg = config.get("wandb", {})
+    if not bool(wandb_cfg.get("enabled", False)):
+        return
+
+    try:
+        import wandb
+    except Exception as exc:  # pragma: no cover
+        logger.warning("wandb requested but unavailable for split plots: %s", exc)
+        return
+
+    mode = str(wandb_cfg.get("mode", "offline")).strip() or "offline"
+    project = str(wandb_cfg.get("project", "driver-fusions-policy-comparison")).strip()
+    entity = str(wandb_cfg.get("entity", "")).strip() or None
+    tags = [str(t) for t in wandb_cfg.get("tags", [])]
+    wandb_dir = str(wandb_cfg.get("dir", "/work/H2020DeciderFicarra/gcapitani")).strip()
+    run_name = f"{policy}_{recon_mode}_split_gene_distribution"
+    group_name = f"{policy}_{recon_mode}_clustering"
+
+    try:
+        run = wandb.init(
+            project=project,
+            entity=entity,
+            mode=mode,
+            dir=wandb_dir,
+            name=run_name,
+            group=group_name,
+            tags=tags + ["clustering", "split-gene-distribution"],
+            config={"policy": policy, "recon_mode": recon_mode, "stage": "cluster"},
+            reinit=True,
+        )
+        payload = {
+            f"clustering/gene_distribution/{split}": wandb.Image(str(path))
+            for split, path in sorted(plot_paths.items())
+        }
+        wandb.log(payload)
+        run.finish()
+    except Exception as exc:  # pragma: no cover
+        logger.warning("wandb logging failed for split gene distributions (%s/%s): %s", policy, recon_mode, exc)
+
+
 def run_reconstruction(
     policy: str,
     recon_mode: str,
@@ -168,6 +295,26 @@ def run_clustering(
     cluster_csv = dirs["clustering"] / "clustered_splits.csv"
     if skip_existing and cluster_csv.exists():
         logger.info("[%s/%s] Clustered split already exists, skipping: %s", policy, recon_mode, cluster_csv)
+        if not dry_run:
+            try:
+                plot_dir = dirs["clustering"] / "split_gene_distribution"
+                plot_paths = generate_split_gene_distribution_plots(cluster_csv, plot_dir, logger=logger)
+                maybe_log_split_gene_plots_to_wandb(
+                    policy=policy,
+                    recon_mode=recon_mode,
+                    plot_paths=plot_paths,
+                    config=config,
+                    logger=logger,
+                )
+                if plot_paths:
+                    logger.info(
+                        "[%s/%s] Saved split gene distribution plots in %s",
+                        policy,
+                        recon_mode,
+                        plot_dir,
+                    )
+            except Exception as exc:
+                logger.warning("[%s/%s] Failed to generate/log split gene distribution plots: %s", policy, recon_mode, exc)
         return cluster_csv
 
     cluster_cfg = config["clustering"]
@@ -195,6 +342,26 @@ def run_clustering(
 
     if not dry_run and not cluster_csv.exists():
         raise FileNotFoundError(f"Clustered split output not found: {cluster_csv}")
+    if not dry_run:
+        try:
+            plot_dir = dirs["clustering"] / "split_gene_distribution"
+            plot_paths = generate_split_gene_distribution_plots(cluster_csv, plot_dir, logger=logger)
+            maybe_log_split_gene_plots_to_wandb(
+                policy=policy,
+                recon_mode=recon_mode,
+                plot_paths=plot_paths,
+                config=config,
+                logger=logger,
+            )
+            if plot_paths:
+                logger.info(
+                    "[%s/%s] Saved split gene distribution plots in %s",
+                    policy,
+                    recon_mode,
+                    plot_dir,
+                )
+        except Exception as exc:
+            logger.warning("[%s/%s] Failed to generate/log split gene distribution plots: %s", policy, recon_mode, exc)
 
     return cluster_csv
 
