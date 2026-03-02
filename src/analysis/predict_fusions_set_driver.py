@@ -22,7 +22,7 @@ from scipy.stats import chi2_contingency, fisher_exact, mannwhitneyu
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from nets import ProbeMLP
+from nets import ProbeConv1D, ProbeMLP
 
 MAX_SEQ_LEN = 4000
 
@@ -85,22 +85,44 @@ def infer_hidden_dims_from_state(state: dict) -> tuple[int, list[int], int]:
     return in_dim, hidden_dims, out_dim
 
 
+def _is_conv1d_checkpoint(state: dict) -> bool:
+    return any(str(k).startswith("conv_net.") for k in state.keys())
+
+
+def _infer_norm_type_from_state(state: dict, prefix: str) -> str:
+    for k in state.keys():
+        key = str(k)
+        if not key.startswith(prefix):
+            continue
+        if key.endswith("running_mean") or key.endswith("running_var") or key.endswith("num_batches_tracked"):
+            return "batchnorm"
+    return "layernorm"
+
+
 def build_model_from_checkpoint(ckpt_path: Path, device: str):
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    in_dim, hidden_dims, out_dim = infer_hidden_dims_from_state(state)
-    model = ProbeMLP(
-        in_dim=in_dim,
-        n_classes=out_dim,
-        hidden_dims=hidden_dims,
-        dropout=0.0,
-        use_batchnorm=True,
-    ).to(device)
+    if _is_conv1d_checkpoint(state):
+        out_dim = int(state["classifier.weight"].shape[0])
+        norm_type = _infer_norm_type_from_state(state, "conv_net.")
+        model = ProbeConv1D(n_classes=out_dim, dropout=0.0, norm_type=norm_type).to(device)
+        in_dim = None
+        hidden_dims = [f"conv1d({norm_type})"]
+    else:
+        in_dim, hidden_dims, out_dim = infer_hidden_dims_from_state(state)
+        norm_type = "none" if len(hidden_dims) == 0 else _infer_norm_type_from_state(state, "net.")
+        model = ProbeMLP(
+            in_dim=in_dim,
+            n_classes=out_dim,
+            hidden_dims=hidden_dims,
+            dropout=0.0,
+            norm_type=norm_type,
+        ).to(device)
     model.load_state_dict(state)
     model.eval()
     return model, in_dim, hidden_dims, out_dim
 
 
-def infer_embedding_model(ckpt_path: Path, in_dim: int, requested: str) -> str:
+def infer_embedding_model(ckpt_path: Path, in_dim: int | None, requested: str) -> str:
     if requested in {"esmc", "fuson"}:
         return requested
 
@@ -1024,7 +1046,7 @@ def main():
         for i, seq in enumerate(sequences, start=1):
             emb = embed_fn(seq)
             x = emb.mean(dim=0) if args.pool == "mean" else emb[0]
-            if int(x.shape[0]) != int(in_dim):
+            if in_dim is not None and int(x.shape[0]) != int(in_dim):
                 raise ValueError(f"Embedding dim mismatch at row {i}: got {x.shape[0]}, expected {in_dim}")
             emb_rows.append(x.cpu())
             if i % 50 == 0 or i == len(df):

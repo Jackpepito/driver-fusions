@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import itertools
+import json
 import math
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from experiment.logging_utils import run_command
 
@@ -60,6 +61,19 @@ def sanitize_token(value: Any) -> str:
     token = token.replace("-", "m")
     token = token.replace("+", "")
     return token
+
+
+def _normalize_probe_arches(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        out = [str(v).strip() for v in value if str(v).strip()]
+        return out or ["linear"]
+    text = str(value).strip()
+    if not text:
+        return ["linear"]
+    if "," in text:
+        out = [item.strip() for item in text.split(",") if item.strip()]
+        return out or ["linear"]
+    return [text]
 
 
 def build_mode_dirs(workspace_root: Path, policy: str, recon_mode: str) -> dict[str, Path]:
@@ -230,6 +244,8 @@ def run_embeddings(
 
 def maybe_log_to_wandb(record: dict[str, Any], config: dict[str, Any], logger) -> None:
     wandb_cfg = config.get("wandb", {})
+    if bool(wandb_cfg.get("log_from_train_probe", True)):
+        return
     if not bool(wandb_cfg.get("enabled", False)):
         return
 
@@ -243,6 +259,7 @@ def maybe_log_to_wandb(record: dict[str, Any], config: dict[str, Any], logger) -
     project = str(wandb_cfg.get("project", "driver-fusions-policy-comparison")).strip()
     entity = str(wandb_cfg.get("entity", "")).strip() or None
     tags = [str(t) for t in wandb_cfg.get("tags", [])]
+    wandb_dir = str(wandb_cfg.get("dir", "/work/H2020DeciderFicarra/gcapitani")).strip()
 
     run_name = f"{record['policy']}_{record['recon_mode']}_{record['model']}_{record['run_id']}"
     group_name = f"{record['policy']}_{record['recon_mode']}_{record['model']}"
@@ -252,6 +269,7 @@ def maybe_log_to_wandb(record: dict[str, Any], config: dict[str, Any], logger) -
             project=project,
             entity=entity,
             mode=mode,
+            dir=wandb_dir,
             name=run_name,
             group=group_name,
             tags=tags,
@@ -281,6 +299,106 @@ def maybe_log_to_wandb(record: dict[str, Any], config: dict[str, Any], logger) -
         logger.warning("wandb logging failed for run %s: %s", run_name, exc)
 
 
+def run_aggregate_baselines(
+    policy: str,
+    recon_mode: str,
+    model: str,
+    dirs: dict[str, Path],
+    config: dict[str, Any],
+    records: list[dict[str, Any]],
+    skip_existing: bool,
+    dry_run: bool,
+    logger,
+) -> list[dict[str, Any]]:
+    if dry_run:
+        logger.info("[%s/%s/%s] Dry run: skipping aggregate baselines.", policy, recon_mode, model)
+        return []
+
+    ckpts: list[str] = []
+    for r in records:
+        ckpt = str(r.get("probe_best_ckpt", "")).strip()
+        if ckpt and Path(ckpt).exists():
+            ckpts.append(ckpt)
+    if not ckpts:
+        logger.info("[%s/%s/%s] No checkpoints available for aggregate baselines.", policy, recon_mode, model)
+        return []
+
+    aggregate_script = PROJECT_ROOT / "src" / "analysis" / "aggregate_policy_models.py"
+    setting_id = f"{policy}_{recon_mode}_{model}"
+    output_root = dirs["training"] / model
+    result_json = output_root / "aggregates" / setting_id / "aggregate_results.json"
+
+    if skip_existing and result_json.exists():
+        try:
+            payload = json.loads(result_json.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                out: list[dict[str, Any]] = []
+                for row in payload:
+                    if not isinstance(row, dict):
+                        continue
+                    out.append({"policy": policy, "recon_mode": recon_mode, "model": model, **row})
+                if out:
+                    logger.info("[%s/%s/%s] Reusing aggregate baselines: %s", policy, recon_mode, model, result_json)
+                    return out
+        except Exception:
+            pass
+
+    wandb_cfg = config.get("wandb", {})
+    cmd = [
+        sys.executable,
+        str(aggregate_script),
+        "--embeddings-dir",
+        str(dirs["embeddings"]),
+        "--model",
+        model,
+        "--pool",
+        str(config["training"].get("pool", "mean")),
+        "--output-dir",
+        str(output_root),
+        "--setting-id",
+        setting_id,
+        "--policy",
+        policy,
+        "--wandb-mode",
+        str(wandb_cfg.get("mode", "disabled")),
+        "--wandb-project",
+        str(wandb_cfg.get("project", "driver-fusions-policy-comparison")),
+        "--wandb-entity",
+        str(wandb_cfg.get("entity", "")),
+        "--wandb-tags",
+        ",".join(str(t) for t in wandb_cfg.get("tags", [])),
+        "--wandb-dir",
+        str(wandb_cfg.get("dir", "/work/H2020DeciderFicarra/gcapitani")),
+    ]
+    if bool(wandb_cfg.get("enabled", False)):
+        cmd.append("--wandb-enabled")
+    if skip_existing:
+        cmd.append("--skip-existing")
+    for ckpt in ckpts:
+        cmd.extend(["--checkpoint", ckpt])
+
+    run_command(cmd, logger=logger, cwd=PROJECT_ROOT, dry_run=False)
+
+    if not result_json.exists():
+        logger.warning("[%s/%s/%s] Aggregate results missing after run: %s", policy, recon_mode, model, result_json)
+        return []
+
+    try:
+        payload = json.loads(result_json.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("[%s/%s/%s] Failed parsing aggregate results: %s", policy, recon_mode, model, exc)
+        return []
+    if not isinstance(payload, list):
+        return []
+
+    out_records: list[dict[str, Any]] = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        out_records.append({"policy": policy, "recon_mode": recon_mode, "model": model, **row})
+    return out_records
+
+
 def train_grid(
     policy: str,
     recon_mode: str,
@@ -290,6 +408,7 @@ def train_grid(
     skip_existing: bool,
     dry_run: bool,
     logger,
+    on_trained_record: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     train_cfg = config["training"]
     grid = train_cfg["grid"]
@@ -298,18 +417,22 @@ def train_grid(
     batch_sizes = list(grid.get("batch_size", [64]))
     noises = list(grid.get("noise", [0.0]))
     gammas = list(grid.get("focal_gamma", [2.0]))
+    probe_arches = _normalize_probe_arches(train_cfg.get("probe_arch", "linear"))
+    wandb_cfg = config.get("wandb", {})
 
     train_script = PROJECT_ROOT / "src" / "train_probe.py"
     records: list[dict[str, Any]] = []
+    trained_records: list[dict[str, Any]] = []
 
-    all_combinations = list(itertools.product(lrs, batch_sizes, noises, gammas))
-    for run_idx, (lr, batch_size, noise, gamma) in enumerate(all_combinations, start=1):
+    all_combinations = list(itertools.product(lrs, batch_sizes, noises, gammas, probe_arches))
+    for run_idx, (lr, batch_size, noise, gamma, probe_arch) in enumerate(all_combinations, start=1):
         run_id = (
             f"{policy}_{recon_mode}_{model}"
             f"_lr{sanitize_token(lr)}"
             f"_bs{sanitize_token(batch_size)}"
             f"_ns{sanitize_token(noise)}"
             f"_fg{sanitize_token(gamma)}"
+            f"_pa{sanitize_token(probe_arch)}"
             f"_{run_idx:03d}"
         )
 
@@ -341,6 +464,8 @@ def train_grid(
                 model,
                 "--run-id",
                 run_id,
+                "--policy",
+                policy,
                 "--pool",
                 str(train_cfg.get("pool", "mean")),
                 "--epochs",
@@ -350,7 +475,7 @@ def train_grid(
                 "--seed",
                 str(train_cfg.get("seed", 42)),
                 "--probe-arch",
-                str(train_cfg.get("probe_arch", "linear")),
+                str(probe_arch),
                 "--probe-hidden-dims",
                 str(train_cfg.get("probe_hidden_dims", "")),
                 "--probe-dropout",
@@ -375,6 +500,23 @@ def train_grid(
             if cfg_path:
                 cmd.extend(["--config", cfg_path])
 
+            if bool(wandb_cfg.get("enabled", False)):
+                cmd.append("--wandb-enabled")
+            cmd.extend(
+                [
+                    "--wandb-mode",
+                    str(wandb_cfg.get("mode", "disabled")),
+                    "--wandb-project",
+                    str(wandb_cfg.get("project", "driver-fusions-policy-comparison")),
+                    "--wandb-entity",
+                    str(wandb_cfg.get("entity", "")),
+                    "--wandb-tags",
+                    ",".join(str(t) for t in wandb_cfg.get("tags", [])),
+                    "--wandb-dir",
+                    str(wandb_cfg.get("dir", "/work/H2020DeciderFicarra/gcapitani")),
+                ]
+            )
+
             run_command(cmd, logger=logger, cwd=PROJECT_ROOT, dry_run=False)
 
             if not summary_path.exists():
@@ -390,6 +532,7 @@ def train_grid(
             "batch_size": int(batch_size),
             "noise": float(noise),
             "focal_gamma": float(gamma),
+            "probe_arch": str(probe_arch),
             "accuracy": metrics["accuracy"],
             "f1": metrics["f1"],
             "auroc": metrics["auroc"],
@@ -399,12 +542,29 @@ def train_grid(
             "probe_best_ckpt": str(ckpt_path),
         }
         records.append(record)
+        trained_records.append(record)
         maybe_log_to_wandb(record, config, logger)
+        if on_trained_record is not None:
+            on_trained_record(record)
+
+    aggregate_records = run_aggregate_baselines(
+        policy=policy,
+        recon_mode=recon_mode,
+        model=model,
+        dirs=dirs,
+        config=config,
+        records=trained_records,
+        skip_existing=skip_existing,
+        dry_run=dry_run,
+        logger=logger,
+    )
+    if aggregate_records:
+        records.extend(aggregate_records)
 
     best_record = None
-    if records:
+    if trained_records:
         best_record = max(
-            records,
+            trained_records,
             key=lambda r: (
                 to_metric_rank(r["auroc"]),
                 to_metric_rank(r["f1"]),
@@ -438,6 +598,7 @@ def collect_existing_training_records(policy: str, recon_mode: str, model: str, 
                 "batch_size": float("nan"),
                 "noise": float("nan"),
                 "focal_gamma": float("nan"),
+                "probe_arch": "unknown",
                 "accuracy": metrics["accuracy"],
                 "f1": metrics["f1"],
                 "auroc": metrics["auroc"],
@@ -468,6 +629,15 @@ def run_external_evaluation(
     dry_run: bool,
     logger,
 ) -> dict[str, str] | None:
+    if not bool(config.get("runtime", {}).get("enable_external_evaluation", False)):
+        logger.info(
+            "[%s/%s/%s] External evaluation disabled by config (runtime.enable_external_evaluation=false).",
+            policy,
+            recon_mode,
+            model,
+        )
+        return None
+
     eval_input = Path(str(config["data"].get("evaluation_input_csv", "")))
     if not eval_input.exists() and not dry_run:
         logger.warning(

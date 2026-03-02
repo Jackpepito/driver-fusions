@@ -27,7 +27,7 @@
     "epochs": 5000,
     "patience": 2000,
     "seed": 42,
-    "probe_arch": ["linear", "deep"],
+    "probe_arch": ["linear", "deep", "conv1d"],
     "probe_hidden_dims": "",
     "probe_dropout": 0.2,
     "lr_scheduler": "plateau",
@@ -36,7 +36,7 @@
     "train_probe_config": "",
     "grid": {
       "lr": [0.001, 0.0001],
-      "batch_size": [64],
+      "batch_size": [64, 128],
       "noise": [0.0, 0.01],
       "focal_gamma": [0.0, 2.0, 4.0]
     }
@@ -46,7 +46,9 @@
     "mode": "online",
     "project": "driver-fusions-policy-comparison",
     "entity": "capitani-experiments",
-    "tags": ["A-B-C-D", "orf-vs-noorf", "grid-search"]
+    "tags": ["A-B-C-D", "orf-vs-noorf", "grid-search"],
+    "dir": "/work/H2020DeciderFicarra/gcapitani",
+    "log_from_train_probe": true
   },
   "runtime": {
     "skip_existing": true

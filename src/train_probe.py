@@ -2,6 +2,7 @@
 """Probe training on pre-computed embeddings for driver/non-driver classification."""
 
 import argparse
+import os
 import re
 import sys
 from datetime import datetime
@@ -16,6 +17,7 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import (
     accuracy_score,
+    brier_score_loss,
     classification_report,
     confusion_matrix,
     f1_score,
@@ -348,10 +350,137 @@ def _to_annotation_presence_binary(series: pd.Series) -> pd.Series:
 
 
 def _compute_random_baseline(labels: np.ndarray, seed: int = 42) -> tuple[np.ndarray, float]:
-    p_driver = float(np.mean(labels))
+    labels = np.asarray(labels, dtype=int)
+    n = len(labels)
+    if n == 0:
+        return np.array([], dtype=int), 0.5
+    # Jeffreys-smoothed prevalence to avoid degenerate p=0 or p=1 on single-class splits.
+    p_driver = float((labels.sum() + 0.5) / (n + 1.0))
     rng = np.random.default_rng(seed)
-    y_rand = (rng.random(len(labels)) < p_driver).astype(int)
+    y_rand = (rng.random(n) < p_driver).astype(int)
+    # Ensure random baseline can emit both classes when enough samples exist.
+    if n > 1 and np.unique(y_rand).size == 1:
+        idx = int(rng.integers(0, n))
+        y_rand[idx] = 1 - y_rand[idx]
     return y_rand, p_driver
+
+
+def _compute_calibration_metrics(labels: np.ndarray, probs: np.ndarray, random_probs: np.ndarray) -> dict:
+    labels = np.asarray(labels, dtype=int)
+    probs = np.clip(np.asarray(probs, dtype=float), 0.0, 1.0)
+    rand = np.clip(np.asarray(random_probs, dtype=float), 0.0, 1.0)
+    if len(labels) == 0:
+        return {
+            "brier": float("nan"),
+            "calibration_quality": float("nan"),
+            "driver_error": float("nan"),
+            "non_driver_error": float("nan"),
+            "random_brier": float("nan"),
+            "random_calibration_quality": float("nan"),
+            "brier_improvement_vs_random": float("nan"),
+        }
+
+    brier = float(brier_score_loss(labels, probs))
+    rand_brier = float(brier_score_loss(labels, rand))
+    driver_mask = labels == 1
+    non_driver_mask = labels == 0
+    driver_error = float(np.mean(1.0 - probs[driver_mask])) if driver_mask.any() else float("nan")
+    non_driver_error = float(np.mean(probs[non_driver_mask])) if non_driver_mask.any() else float("nan")
+    return {
+        "brier": brier,
+        "calibration_quality": float(1.0 - brier),
+        "driver_error": driver_error,
+        "non_driver_error": non_driver_error,
+        "random_brier": rand_brier,
+        "random_calibration_quality": float(1.0 - rand_brier),
+        "brier_improvement_vs_random": float(rand_brier - brier),
+    }
+
+
+def _init_wandb_run(args, run_id: str, out_dir: Path, dim: int, n_train: int, n_val: int, n_test: int):
+    if not args.wandb_enabled or args.wandb_mode == "disabled":
+        return None
+    try:
+        import wandb
+    except Exception as exc:
+        print(f"[WARNING] wandb init skipped: {exc}")
+        return None
+
+    os.environ["WANDB_DIR"] = args.wandb_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tags = [t.strip() for t in str(args.wandb_tags).split(",") if t.strip()]
+    policy = str(getattr(args, "policy", "")).strip().upper()
+    return wandb.init(
+        project=args.wandb_project,
+        entity=(str(args.wandb_entity).strip() or None),
+        mode=args.wandb_mode,
+        dir=args.wandb_dir,
+        name=run_id,
+        tags=tags,
+        config={
+            "policy": policy,
+            "run_id": run_id,
+            "model": args.model,
+            "pool": args.pool,
+            "probe_arch": args.probe_arch,
+            "probe_hidden_dims": args.probe_hidden_dims,
+            "probe_dropout": args.probe_dropout,
+            "epochs": args.epochs,
+            "patience": args.patience,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "lr_scheduler": args.lr_scheduler,
+            "lr_reduce_factor": args.lr_reduce_factor,
+            "lr_min": args.lr_min,
+            "focal_gamma": args.focal_gamma,
+            "train_noise_std": args.train_noise_std,
+            "seed": args.seed,
+            "embedding_dim": int(dim),
+            "n_train": int(n_train),
+            "n_val": int(n_val),
+            "n_test": int(n_test),
+            "embeddings_dir": str(args.embeddings_dir),
+            "output_dir": str(out_dir),
+        },
+        reinit=True,
+    )
+
+
+def _cm_figure(cm: np.ndarray, title: str):
+    fig, ax = plt.subplots(figsize=(4.8, 4.2))
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_xticks([0, 1], labels=["pred_non-driver", "pred_driver"])
+    ax.set_yticks([0, 1], labels=["true_non-driver", "true_driver"])
+    ax.set_title(title)
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, str(int(cm[i, j])), ha="center", va="center", color="black")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    return fig
+
+
+def _wandb_log_confusion(run, key: str, y_true: np.ndarray, y_pred: np.ndarray, title: str) -> None:
+    if run is None:
+        return
+    try:
+        import wandb
+        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+        fig = _cm_figure(cm, title)
+        run.log({key: wandb.Image(fig)})
+        plt.close(fig)
+    except Exception as exc:
+        print(f"[WARNING] wandb confusion-matrix log failed for {key}: {exc}")
+
+
+def _wandb_log_image_path(run, key: str, path: Path) -> None:
+    if run is None or path is None or not Path(path).exists():
+        return
+    try:
+        import wandb
+        run.log({key: wandb.Image(str(path))})
+    except Exception as exc:
+        print(f"[WARNING] wandb image log failed for {path}: {exc}")
 
 
 def _normalize_gene_name(v) -> str:
@@ -724,7 +853,11 @@ def _rate_by_category_summary_lines(
     return lines
 
 
-def _plot_probability_distribution(df: pd.DataFrame, out_path: Path) -> Path | None:
+def _plot_probability_distribution(
+    df: pd.DataFrame,
+    out_path: Path,
+    title: str = "Test-set probability distribution",
+) -> Path | None:
     if "y_prob_driver" not in df.columns or "y_true" not in df.columns:
         return None
     probs_non = df.loc[df["y_true"] == 0, "y_prob_driver"].dropna().values
@@ -736,7 +869,7 @@ def _plot_probability_distribution(df: pd.DataFrame, out_path: Path) -> Path | N
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(probs_non, bins=bins, alpha=0.55, label="true non-driver", color="#4c72b0", density=True)
     ax.hist(probs_drv, bins=bins, alpha=0.55, label="true driver", color="#dd5555", density=True)
-    ax.set_title("Test-set probability distribution")
+    ax.set_title(title)
     ax.set_xlabel("Predicted P(driver)")
     ax.set_ylabel("Density")
     ax.legend()
@@ -1602,6 +1735,8 @@ def analyze_test_predictions(
         "baseline_random_confusion_matrix": cm_random,
         "baseline_gene_confusion_matrix": cm_gene,
         "baseline_random_driver_rate_reference": p_driver,
+        "y_pred_random": y_rand,
+        "y_pred_gene_baseline": y_gene,
         "top_numeric": top_num,
         "top_categorical": top_cat,
     }
@@ -1648,7 +1783,12 @@ def main():
         default="",
         help="Run identifier for output folder. If empty, uses timestamp.",
     )
-    parser.add_argument("--probe-arch", default="linear", choices=["linear", "deep"])
+    parser.add_argument(
+        "--policy",
+        default="",
+        help="Policy label (e.g. A/B/C/D) to store in W&B config for filtering.",
+    )
+    parser.add_argument("--probe-arch", default="linear", choices=["linear", "deep", "conv1d"])
     parser.add_argument(
         "--probe-hidden-dims",
         default="",
@@ -1666,6 +1806,25 @@ def main():
         type=float,
         default=2.0,
         help="Focal loss gamma. Set to 0.0 to recover standard cross-entropy.",
+    )
+    parser.add_argument("--wandb-enabled", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument(
+        "--wandb-mode",
+        default="disabled",
+        choices=["disabled", "offline", "online"],
+        help="W&B mode (disabled/offline/online).",
+    )
+    parser.add_argument("--wandb-project", default="driver-fusions-policy-comparison")
+    parser.add_argument("--wandb-entity", default="")
+    parser.add_argument(
+        "--wandb-tags",
+        default="",
+        help="Comma-separated W&B tags.",
+    )
+    parser.add_argument(
+        "--wandb-dir",
+        default="/work/H2020DeciderFicarra/gcapitani",
+        help="Directory for local W&B files.",
     )
 
     valid_dests = {a.dest for a in parser._actions}
@@ -1696,9 +1855,22 @@ def main():
 
     # UMAP plots and artifacts output
     run_id = args.run_id.strip() or datetime.now().strftime("%Y%m%d_%H%M%S")
+    if not str(args.policy).strip():
+        inferred = run_id.split("_", 1)[0].strip().upper()
+        if inferred in {"A", "B", "C", "D"}:
+            args.policy = inferred
     out_dir = Path(args.output_dir) / args.model / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Saving outputs to {out_dir}")
+    wandb_run = _init_wandb_run(
+        args,
+        run_id=run_id,
+        out_dir=out_dir,
+        dim=int(dim),
+        n_train=len(X_train),
+        n_val=len(X_val),
+        n_test=len(X_test),
+    )
 
     # Frame distribution by split (true labels from loaded embeddings)
     frame_dist_parts = [
@@ -1779,6 +1951,29 @@ def main():
             f"test_loss {test_epoch['loss']:.4f} | test_auroc {test_epoch['auroc']:.4f} | test_f1 {test_epoch['f1']:.4f} | "
             f"lr {curr_lr:.6g}{flag}"
         )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "epoch": ep,
+                    "train/loss": float(train_loss),
+                    "val/loss": float(val["loss"]),
+                    "val/accuracy": float(val["acc"]),
+                    "val/f1": float(val["f1"]),
+                    "val/auroc": float(val["auroc"]),
+                    "val/precision": float(val["prec"]),
+                    "val/recall": float(val["rec"]),
+                    "test/loss": float(test_epoch["loss"]),
+                    "test/accuracy": float(test_epoch["acc"]),
+                    "test/f1": float(test_epoch["f1"]),
+                    "test/auroc": float(test_epoch["auroc"]),
+                    "test/precision": float(test_epoch["prec"]),
+                    "test/recall": float(test_epoch["rec"]),
+                    "optim/lr": float(curr_lr),
+                    "train/best_val_auroc_so_far": float(best_auroc),
+                    "train/improved_best": int(improved),
+                },
+                step=ep,
+            )
         if curr_lr < prev_lr:
             print(
                 f"  LR reduced at epoch {ep}: {prev_lr:.6g} -> {curr_lr:.6g} "
@@ -1804,6 +1999,37 @@ def main():
     if "fusion_pairs" in meta_test:
         print_per_fusion_results(t_last["preds"], t_last["labels"], meta_test["fusion_pairs"])
 
+    test_rand_for_calib, _ = _compute_random_baseline(np.array(t_best["labels"]), seed=42)
+    test_calibration = _compute_calibration_metrics(
+        np.array(t_best["labels"]),
+        np.array(t_best["probs"]),
+        test_rand_for_calib.astype(float),
+    )
+    print("\n>>> Test calibration (best model):")
+    print(
+        "  "
+        f"Brier={test_calibration['brier']:.6f} | "
+        f"Quality(1-Brier)={test_calibration['calibration_quality']:.6f} | "
+        f"DriverErr(1-p|y=1)={test_calibration['driver_error']:.6f} | "
+        f"NonDriverErr(p|y=0)={test_calibration['non_driver_error']:.6f} | "
+        f"RandomBrier={test_calibration['random_brier']:.6f} | "
+        f"DeltaBrierVsRandom={test_calibration['brier_improvement_vs_random']:.6f}"
+    )
+    if wandb_run is not None:
+        wandb_run.log(
+            {
+                "test_best/calibration_brier": float(test_calibration["brier"]),
+                "test_best/calibration_quality": float(test_calibration["calibration_quality"]),
+                "test_best/calibration_driver_error": float(test_calibration["driver_error"]),
+                "test_best/calibration_non_driver_error": float(test_calibration["non_driver_error"]),
+                "test_best/calibration_random_brier": float(test_calibration["random_brier"]),
+                "test_best/calibration_random_quality": float(test_calibration["random_calibration_quality"]),
+                "test_best/calibration_brier_improvement_vs_random": float(
+                    test_calibration["brier_improvement_vs_random"]
+                ),
+            }
+        )
+
     # Benchmark evaluation — load pre-computed benchmark embeddings
     gene_counts_train, _ = _build_gene_frequency_baseline(meta_train)
     bm_pt = emb_dir / "benchmark.pt"
@@ -1812,12 +2038,15 @@ def main():
         "metrics_txt": None,
         "per_fusion_plot": None,
         "per_fusion_txt": None,
+        "prob_plot": None,
+        "prob_txt": None,
         "metrics_model": None,
         "metrics_random": None,
         "metrics_gene": None,
         "cm_random": None,
         "cm_gene": None,
         "random_ref_driver_rate": None,
+        "calibration": None,
     }
     if bm_pt.exists():
         X_bm, y_bm, meta_bm = load_embeddings(emb_dir, "benchmark", args.pool)
@@ -1880,6 +2109,65 @@ def main():
                 "random_ref_driver_rate": bm_p_driver,
             }
         )
+        bm_calibration = _compute_calibration_metrics(
+            bm_labels,
+            np.array(bm_best["probs"]),
+            bm_rand.astype(float),
+        )
+        bm_prob_df = pd.DataFrame(
+            {
+                "y_true": bm_labels.astype(int),
+                "y_prob_driver": np.array(bm_best["probs"], dtype=float),
+            }
+        )
+        bm_prob_plot = _plot_probability_distribution(
+            bm_prob_df,
+            out_dir / "plot_benchmark_prob_driver_distribution.png",
+            title="Benchmark probability distribution",
+        )
+        bm_prob_txt = None
+        if bm_prob_plot is not None:
+            probs_non = bm_prob_df.loc[bm_prob_df["y_true"] == 0, "y_prob_driver"].dropna()
+            probs_drv = bm_prob_df.loc[bm_prob_df["y_true"] == 1, "y_prob_driver"].dropna()
+            bm_prob_txt = _plot_txt_path(bm_prob_plot)
+            _write_text_lines(
+                bm_prob_txt,
+                [
+                    "Benchmark probability distribution summary",
+                    f"true non-driver: n={len(probs_non)}, mean={float(probs_non.mean()):.6f}, std={float(probs_non.std(ddof=1)) if len(probs_non)>1 else 0.0:.6f}",
+                    f"true driver: n={len(probs_drv)}, mean={float(probs_drv.mean()):.6f}, std={float(probs_drv.std(ddof=1)) if len(probs_drv)>1 else 0.0:.6f}",
+                ],
+            )
+        bm_artifacts.update(
+            {
+                "prob_plot": bm_prob_plot,
+                "prob_txt": bm_prob_txt,
+            }
+        )
+        bm_artifacts["calibration"] = bm_calibration
+        print(
+            "\n>>> Benchmark calibration (best model): "
+            f"Brier={bm_calibration['brier']:.6f}, "
+            f"Quality(1-Brier)={bm_calibration['calibration_quality']:.6f}, "
+            f"RandomBrier={bm_calibration['random_brier']:.6f}, "
+            f"DeltaBrierVsRandom={bm_calibration['brier_improvement_vs_random']:.6f}"
+        )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "benchmark_best/calibration_brier": float(bm_calibration["brier"]),
+                    "benchmark_best/calibration_quality": float(bm_calibration["calibration_quality"]),
+                    "benchmark_best/calibration_driver_error": float(bm_calibration["driver_error"]),
+                    "benchmark_best/calibration_non_driver_error": float(bm_calibration["non_driver_error"]),
+                    "benchmark_best/calibration_random_brier": float(bm_calibration["random_brier"]),
+                    "benchmark_best/calibration_random_quality": float(
+                        bm_calibration["random_calibration_quality"]
+                    ),
+                    "benchmark_best/calibration_brier_improvement_vs_random": float(
+                        bm_calibration["brier_improvement_vs_random"]
+                    ),
+                }
+            )
 
         if bm_pairs:
             preds_by_method = {
@@ -1983,6 +2271,93 @@ def main():
         print(f"Benchmark per-fusion baseline comparison plot saved to {bm_artifacts['per_fusion_plot']}")
     if bm_artifacts["per_fusion_txt"] is not None:
         print(f"Benchmark per-fusion baseline comparison table saved to {bm_artifacts['per_fusion_txt']}")
+    if bm_artifacts["prob_plot"] is not None:
+        print(f"Benchmark probability distribution plot saved to {bm_artifacts['prob_plot']}")
+    if bm_artifacts["prob_txt"] is not None:
+        print(f"Benchmark probability distribution summary saved to {bm_artifacts['prob_txt']}")
+
+    if wandb_run is not None:
+        wandb_run.summary["paths/out_dir"] = str(out_dir)
+        wandb_run.summary["paths/summary_txt"] = str(out_dir / "summary.txt")
+        wandb_run.log(
+            {
+                "test_best/accuracy": float(t_best["acc"]),
+                "test_best/f1": float(t_best["f1"]),
+                "test_best/auroc": float(t_best["auroc"]),
+                "test_best/precision": float(t_best["prec"]),
+                "test_best/recall": float(t_best["rec"]),
+                "test_last/accuracy": float(t_last["acc"]),
+                "test_last/f1": float(t_last["f1"]),
+                "test_last/auroc": float(t_last["auroc"]),
+                "test_last/precision": float(t_last["prec"]),
+                "test_last/recall": float(t_last["rec"]),
+            }
+        )
+        if bm_artifacts["metrics_model"] is not None:
+            bmm = bm_artifacts["metrics_model"]
+            wandb_run.log(
+                {
+                    "benchmark_best/accuracy": float(bmm["accuracy"]),
+                    "benchmark_best/f1": float(bmm["f1"]),
+                    "benchmark_best/precision": float(bmm["precision"]),
+                    "benchmark_best/recall": float(bmm["recall"]),
+                }
+            )
+
+        _wandb_log_confusion(
+            wandb_run,
+            key="confusion/test_best",
+            y_true=np.array(t_best["labels"]),
+            y_pred=np.array(t_best["preds"]),
+            title="Test best confusion matrix",
+        )
+        _wandb_log_confusion(
+            wandb_run,
+            key="confusion/test_last",
+            y_true=np.array(t_last["labels"]),
+            y_pred=np.array(t_last["preds"]),
+            title="Test last confusion matrix",
+        )
+        _wandb_log_confusion(
+            wandb_run,
+            key="confusion/test_random_baseline",
+            y_true=np.array(t_best["labels"]),
+            y_pred=np.array(analysis_artifacts["y_pred_random"]),
+            title="Test random baseline confusion matrix",
+        )
+        _wandb_log_confusion(
+            wandb_run,
+            key="confusion/test_gene_baseline",
+            y_true=np.array(t_best["labels"]),
+            y_pred=np.array(analysis_artifacts["y_pred_gene_baseline"]),
+            title="Test gene baseline confusion matrix",
+        )
+        if bm_pt.exists():
+            _wandb_log_confusion(
+                wandb_run,
+                key="confusion/benchmark_best",
+                y_true=np.array(bm_best["labels"]),
+                y_pred=np.array(bm_best["preds"]),
+                title="Benchmark best confusion matrix",
+            )
+            if bm_artifacts["metrics_model"] is not None:
+                _wandb_log_confusion(
+                    wandb_run,
+                    key="confusion/benchmark_random_baseline",
+                    y_true=np.array(bm_best["labels"]),
+                    y_pred=np.array(bm_rand),
+                    title="Benchmark random baseline confusion matrix",
+                )
+                _wandb_log_confusion(
+                    wandb_run,
+                    key="confusion/benchmark_gene_baseline",
+                    y_true=np.array(bm_best["labels"]),
+                    y_pred=np.array(bm_gene),
+                    title="Benchmark gene baseline confusion matrix",
+                )
+
+        for png_path in sorted(out_dir.glob("*.png")):
+            _wandb_log_image_path(wandb_run, f"plots/{png_path.stem}", png_path)
     _print_top_probability_tables(
         "TEST SET: TOP FUSIONS BY P(driver)",
         analysis_artifacts["top_driver_prob"],
@@ -2005,6 +2380,15 @@ def main():
         ),
         "",
         format_test_results(t_best, args.model, args.pool, "BEST AUROC MODEL"),
+        "",
+        "Calibration (best test model):",
+        f"  - brier: {test_calibration['brier']:.6f}",
+        f"  - calibration_quality (1-brier): {test_calibration['calibration_quality']:.6f}",
+        f"  - driver_error (mean(1-p_driver|y=1)): {test_calibration['driver_error']:.6f}",
+        f"  - non_driver_error (mean(p_driver|y=0)): {test_calibration['non_driver_error']:.6f}",
+        f"  - random_brier: {test_calibration['random_brier']:.6f}",
+        f"  - random_calibration_quality (1-brier): {test_calibration['random_calibration_quality']:.6f}",
+        f"  - brier_improvement_vs_random: {test_calibration['brier_improvement_vs_random']:.6f}",
     ]
     if bm_pt.exists():
         summary_sections.extend([
@@ -2042,6 +2426,21 @@ def main():
                 f"  - benchmark metrics txt: {bm_artifacts['metrics_txt']}",
                 f"  - benchmark per-fusion plot: {bm_artifacts['per_fusion_plot'] if bm_artifacts['per_fusion_plot'] is not None else 'N/A'}",
                 f"  - benchmark per-fusion table: {bm_artifacts['per_fusion_txt'] if bm_artifacts['per_fusion_txt'] is not None else 'N/A'}",
+                f"  - benchmark probability distribution plot: {bm_artifacts['prob_plot'] if bm_artifacts['prob_plot'] is not None else 'N/A'}",
+                f"  - benchmark probability distribution summary: {bm_artifacts['prob_txt'] if bm_artifacts['prob_txt'] is not None else 'N/A'}",
+            ])
+        if bm_artifacts["calibration"] is not None:
+            bcal = bm_artifacts["calibration"]
+            summary_sections.extend([
+                "",
+                "Benchmark calibration (best model):",
+                f"  - brier: {bcal['brier']:.6f}",
+                f"  - calibration_quality (1-brier): {bcal['calibration_quality']:.6f}",
+                f"  - driver_error (mean(1-p_driver|y=1)): {bcal['driver_error']:.6f}",
+                f"  - non_driver_error (mean(p_driver|y=0)): {bcal['non_driver_error']:.6f}",
+                f"  - random_brier: {bcal['random_brier']:.6f}",
+                f"  - random_calibration_quality (1-brier): {bcal['random_calibration_quality']:.6f}",
+                f"  - brier_improvement_vs_random: {bcal['brier_improvement_vs_random']:.6f}",
             ])
 
     summary_sections.extend([
@@ -2140,6 +2539,12 @@ def main():
     summary_path = out_dir / "summary.txt"
     summary_path.write_text("\n".join(summary_sections) + "\n", encoding="utf-8")
     print(f"Summary saved to {summary_path}")
+    if wandb_run is not None:
+        try:
+            wandb_run.save(str(summary_path))
+        except Exception as exc:
+            print(f"[WARNING] wandb summary upload failed: {exc}")
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

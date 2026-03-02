@@ -40,7 +40,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "epochs": 2000,
         "patience": 400,
         "seed": 42,
-        "probe_arch": "linear",
+        "probe_arch": ["linear"],
         "probe_hidden_dims": "",
         "probe_dropout": 0.2,
         "lr_scheduler": "plateau",
@@ -60,9 +60,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "project": "driver-fusions-policy-comparison",
         "entity": "",
         "tags": ["policy-comparison", "grid-search"],
+        "dir": "/work/H2020DeciderFicarra/gcapitani",
+        "log_from_train_probe": True,
     },
     "runtime": {
         "skip_existing": True,
+        "enable_external_evaluation": False,
     },
 }
 

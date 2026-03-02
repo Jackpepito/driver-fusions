@@ -17,7 +17,6 @@ BENCHMARK_GENE_PAIRS = [
     ("EML4", "ALK"),
 ]
 
-
 def ensure_mmseqs_in_path():
     if shutil.which("mmseqs") is None:
         os.environ["PATH"] = f"{MMSEQS_DIR}:{os.environ['PATH']}"

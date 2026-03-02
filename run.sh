@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=50G
 #SBATCH --ntasks-per-node=1   # This needs to match Trainer(devices=...)
-##SBATCH --constraint="gpu_A40_45G|gpu_L40S_45G|gpu_RTX5000_16G|gpu_RTX6000_24G|gpu_RTX_A5000_24G"
+#SBATCH --constraint="gpu_A40_45G|gpu_L40S_45G|gpu_RTX5000_16G|gpu_RTX6000_24G|gpu_RTX_A5000_24G"
 #SBATCH --time=24:00:00
 #SBATCH --account=H2020DeciderFicarra
 
