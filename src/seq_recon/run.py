@@ -87,6 +87,7 @@ def run_chimerseq_reconstruction(
     output_prefix: str = "chimerseq_analysis",
     use_orffinder: bool = True,
     orffinder_path: str = "/homes/gcapitani/Gene-Fusions/data/ORFfinder",
+    min_protein_len_aa: int = 30,
     drivers_only: bool = False,
     cancer_type: str = None,
     random_state: int = 42
@@ -106,6 +107,7 @@ def run_chimerseq_reconstruction(
         output_prefix: Prefix for output files
         use_orffinder: Whether to use ORFfinder for ORF detection
         orffinder_path: Path to ORFfinder executable
+        min_protein_len_aa: Minimum reconstructed protein length in amino acids
         drivers_only: If True, only process driver fusions
         cancer_type: If set, filter to this cancer type (e.g. 'BRCA')
         random_state: Random seed for sampling
@@ -128,6 +130,7 @@ def run_chimerseq_reconstruction(
     print(f"  ORFfinder:       {'enabled' if use_orffinder else 'disabled'}")
     if use_orffinder:
         print(f"  ORFfinder path:  {orffinder_path}")
+    print(f"  Min protein len: {min_protein_len_aa} aa")
     print(f"  Drivers only:    {drivers_only}")
     print(f"  Cancer type:     {cancer_type if cancer_type else 'all'}")
     print(f"  Random seed:     {random_state}")
@@ -283,6 +286,17 @@ def run_chimerseq_reconstruction(
                 test_df.at[idx, 'recon_status'] = 'no_variants'
                 test_df.at[idx, 'num_variants'] = 0
                 continue
+
+            if min_protein_len_aa > 0:
+                fusion_results = [
+                    r for r in fusion_results
+                    if len(r.protein_seq.replace('*', '')) >= min_protein_len_aa
+                ]
+                if not fusion_results:
+                    print(f"\n  All variants discarded: reconstructed protein shorter than {min_protein_len_aa} aa")
+                    test_df.at[idx, 'recon_status'] = 'no_variants'
+                    test_df.at[idx, 'num_variants'] = 0
+                    continue
 
             # Select best result: prioritize in-frame, then longest protein
             in_frame_results = [r for r in fusion_results if r.in_frame]
@@ -649,6 +663,12 @@ Examples:
         default='/homes/gcapitani/Gene-Fusions/data/ORFfinder',
         help='Path to ORFfinder executable'
     )
+    parser.add_argument(
+        '--min-protein-len-aa',
+        type=int,
+        default=30,
+        help='Minimum reconstructed protein length in amino acids (default: 30, set 0 to disable)'
+    )
 
     parser.add_argument(
         '--drivers-only',
@@ -679,6 +699,7 @@ Examples:
         output_prefix=args.output,
         use_orffinder=not args.no_orffinder,
         orffinder_path=args.orffinder_path,
+        min_protein_len_aa=args.min_protein_len_aa,
         drivers_only=args.drivers_only,
         cancer_type=args.cancer_type,
         random_state=args.seed

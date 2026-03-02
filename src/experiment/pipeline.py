@@ -131,6 +131,8 @@ def run_reconstruction(
         str(recon_cfg.get("seed", 42)),
         "--genome-build",
         str(recon_cfg.get("genome_build", "all")),
+        "--min-protein-len-aa",
+        str(int(recon_cfg.get("min_protein_len_aa", 30))),
     ]
 
     n_samples = recon_cfg.get("n_samples")

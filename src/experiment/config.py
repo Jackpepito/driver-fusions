@@ -27,6 +27,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "seed": 42,
         "n_samples": None,
         "orffinder_path": "/homes/gcapitani/Gene-Fusions/data/ORFfinder",
+        "min_protein_len_aa": 30,
     },
     "clustering": {
         "min_seq_id": 0.3,

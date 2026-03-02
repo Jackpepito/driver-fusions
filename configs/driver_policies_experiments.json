@@ -1,7 +1,7 @@
 {
   "workspace_root": "/work/H2020DeciderFicarra/gcapitani",
   "policies": ["A", "B", "C", "D"],
-  "recon_modes": ["ORF", "Without_ORF"],
+  "recon_modes": ["ORF"],
   "models": ["esmc", "fuson"],
   "data": {
     "chimerseq_csv": "/homes/gcapitani/Gene-Fusions/data/ChimerSeq4.csv",
@@ -13,7 +13,8 @@
     "genome_build": "all",
     "seed": 42,
     "n_samples": null,
-    "orffinder_path": "/homes/gcapitani/Gene-Fusions/data/ORFfinder"
+    "orffinder_path": "/homes/gcapitani/Gene-Fusions/data/ORFfinder",
+    "min_protein_len_aa": 30
   },
   "clustering": {
     "min_seq_id": 0.3,
@@ -27,7 +28,7 @@
     "epochs": 5000,
     "patience": 2000,
     "seed": 42,
-    "probe_arch": ["linear", "deep", "conv1d"],
+    "probe_arch": ["linear", "deep"],
     "probe_hidden_dims": "",
     "probe_dropout": 0.2,
     "lr_scheduler": "plateau",
@@ -36,9 +37,9 @@
     "train_probe_config": "",
     "grid": {
       "lr": [0.001, 0.0001],
-      "batch_size": [64, 128],
+      "batch_size": [64],
       "noise": [0.0, 0.01],
-      "focal_gamma": [0.0, 2.0, 4.0]
+      "focal_gamma": [0.0, 2.0]
     }
   },
   "wandb": {

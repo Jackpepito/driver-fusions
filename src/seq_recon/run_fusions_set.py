@@ -183,6 +183,7 @@ def run_fusions_set_reconstruction(
     output_prefix: str = "fusions_set1_17",
     use_orffinder: bool = True,
     orffinder_path: str = "/homes/gcapitani/Gene-Fusions/data/ORFfinder",
+    min_protein_len_aa: int = 30,
     only_protein_coding: bool = True,
     only_with_sequence: bool = True,
     random_state: int = 42,
@@ -214,6 +215,7 @@ def run_fusions_set_reconstruction(
     print(f"  ORFfinder:           {'enabled' if use_orffinder else 'disabled'}")
     if use_orffinder:
         print(f"  ORFfinder path:      {orffinder_path}")
+    print(f"  Min protein len:     {min_protein_len_aa} aa")
     print(f"  Only protein-coding: {only_protein_coding}")
     print(f"  Only with sequence:  {only_with_sequence}")
     print(f"  Random seed:         {random_state}")
@@ -297,6 +299,17 @@ def run_fusions_set_reconstruction(
                 test_df.at[idx, "recon_status"] = "no_variants"
                 test_df.at[idx, "num_variants"] = 0
                 continue
+
+            if min_protein_len_aa > 0:
+                fusion_results = [
+                    r for r in fusion_results
+                    if len(r.protein_seq.replace("*", "")) >= min_protein_len_aa
+                ]
+                if not fusion_results:
+                    print(f"  All variants discarded: reconstructed protein shorter than {min_protein_len_aa} aa")
+                    test_df.at[idx, "recon_status"] = "no_variants"
+                    test_df.at[idx, "num_variants"] = 0
+                    continue
 
             # Keep selection strategy aligned with run.py
             in_frame_results = [r for r in fusion_results if r.in_frame]
@@ -496,6 +509,12 @@ def main():
         help="Include non-protein-coding fusions (default: excluded)",
     )
     parser.add_argument(
+        "--min-protein-len-aa",
+        type=int,
+        default=30,
+        help="Minimum reconstructed protein length in amino acids (default: 30, set 0 to disable)",
+    )
+    parser.add_argument(
         "--include-no-sequence",
         action="store_true",
         help="Include rows without peptide_sequence (default: excluded)",
@@ -520,6 +539,7 @@ def main():
         output_prefix=args.output,
         use_orffinder=not args.no_orffinder,
         orffinder_path=args.orffinder_path,
+        min_protein_len_aa=args.min_protein_len_aa,
         only_protein_coding=not args.include_non_coding,
         only_with_sequence=not args.include_no_sequence,
         random_state=args.seed,
