@@ -20,7 +20,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "chimerseq_csv": "/homes/gcapitani/Gene-Fusions/data/ChimerSeq4.csv",
         "census_tsv": "/homes/gcapitani/Gene-Fusions/data/Census_allFri Jun 27 11_25_18 2025.tsv",
         "benchmark_csv": "/homes/gcapitani/driver-fusions/data/benchmark_fusions.csv",
-        "evaluation_input_csv": "/work/H2020DeciderFicarra/gcapitani/driver-fusion/fusions_set1_17/fusions_set1_17_reconstructed_sequences.csv",
     },
     "reconstruction": {
         "genome_build": "all",
@@ -66,7 +65,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "runtime": {
         "skip_existing": True,
-        "enable_external_evaluation": False,
     },
 }
 

@@ -490,24 +490,83 @@ def _normalize_gene_name(v) -> str:
     return s.upper()
 
 
-def _extract_gene_pair_from_row(row: pd.Series) -> tuple[str, str]:
-    h_gene = ""
-    t_gene = ""
-    if "H_gene" in row.index:
-        h_gene = _normalize_gene_name(row.get("H_gene", ""))
-    if "T_gene" in row.index:
-        t_gene = _normalize_gene_name(row.get("T_gene", ""))
+def _extract_gene_pair_from_row(row: pd.Series | dict) -> tuple[str, str]:
+    def _get(name: str):
+        if isinstance(row, dict):
+            return row.get(name, "")
+        return row.get(name, "") if name in row.index else ""
 
-    if (not h_gene or not t_gene) and "fusion_pair" in row.index:
-        pair = str(row.get("fusion_pair", "")).strip()
-        if "-" in pair:
+    h_gene = _normalize_gene_name(_get("H_gene"))
+    t_gene = _normalize_gene_name(_get("T_gene"))
+
+    if (not h_gene or not t_gene):
+        h_gene = h_gene or _normalize_gene_name(_get("gene5"))
+        t_gene = t_gene or _normalize_gene_name(_get("gene3"))
+
+    if (not h_gene or not t_gene):
+        h_gene = h_gene or _normalize_gene_name(_get("Gene1"))
+        t_gene = t_gene or _normalize_gene_name(_get("Gene2"))
+
+    if not h_gene or not t_gene:
+        for key in ("fusion_pair", "Fusion_pair"):
+            pair = str(_get(key)).strip()
+            if "-" not in pair:
+                continue
             parts = pair.split("-", 1)
-            if len(parts) == 2:
-                if not h_gene:
-                    h_gene = _normalize_gene_name(parts[0])
-                if not t_gene:
-                    t_gene = _normalize_gene_name(parts[1])
+            if len(parts) != 2:
+                continue
+            if not h_gene:
+                h_gene = _normalize_gene_name(parts[0])
+            if not t_gene:
+                t_gene = _normalize_gene_name(parts[1])
+            if h_gene and t_gene:
+                break
     return h_gene, t_gene
+
+
+def _compute_ood_unseen_both_mask(meta_train: dict, meta_test: dict, n_test: int) -> tuple[np.ndarray, dict]:
+    train_rows = meta_train.get("metadata_rows") if isinstance(meta_train, dict) else None
+    test_rows = meta_test.get("metadata_rows") if isinstance(meta_test, dict) else None
+
+    mask = np.zeros(int(n_test), dtype=bool)
+    stats = {
+        "n_test_total": int(n_test),
+        "n_test_rows_with_metadata": 0,
+        "n_test_rows_valid_genes": 0,
+        "n_ood_unseen_both": 0,
+        "train_gene_count": 0,
+        "available": False,
+    }
+
+    if not train_rows or not test_rows:
+        return mask, stats
+
+    train_genes: set[str] = set()
+    for row in train_rows:
+        h_gene, t_gene = _extract_gene_pair_from_row(row)
+        if h_gene:
+            train_genes.add(h_gene)
+        if t_gene:
+            train_genes.add(t_gene)
+
+    stats["train_gene_count"] = int(len(train_genes))
+    if not train_genes:
+        return mask, stats
+
+    usable = min(int(n_test), len(test_rows))
+    stats["n_test_rows_with_metadata"] = int(usable)
+    for i in range(usable):
+        h_gene, t_gene = _extract_gene_pair_from_row(test_rows[i])
+        if not h_gene or not t_gene:
+            continue
+        stats["n_test_rows_valid_genes"] += 1
+        if h_gene in train_genes or t_gene in train_genes:
+            continue
+        mask[i] = True
+
+    stats["n_ood_unseen_both"] = int(mask.sum())
+    stats["available"] = True
+    return mask, stats
 
 
 def _build_gene_frequency_baseline(meta_train: dict) -> tuple[dict[str, dict[str, int]], pd.DataFrame]:
@@ -2030,6 +2089,89 @@ def main():
             }
         )
 
+    ood_best = None
+    ood_last = None
+    ood_prob_plot = None
+    ood_prob_txt = None
+    ood_stats = {
+        "n_test_total": int(len(X_test)),
+        "n_test_rows_with_metadata": 0,
+        "n_test_rows_valid_genes": 0,
+        "n_ood_unseen_both": 0,
+        "train_gene_count": 0,
+        "available": False,
+    }
+    ood_mask, ood_stats = _compute_ood_unseen_both_mask(meta_train, meta_test, len(X_test))
+    print(
+        "\n>>> OOD unseen-both-gene subset:",
+        f"n_ood={ood_stats['n_ood_unseen_both']}/{ood_stats['n_test_total']}",
+        f"(valid_gene_rows={ood_stats['n_test_rows_valid_genes']}, train_genes={ood_stats['train_gene_count']})",
+    )
+    if int(ood_stats["n_ood_unseen_both"]) > 0:
+        ood_idx = np.flatnonzero(ood_mask)
+        x_test_ood = X_test[ood_idx]
+        y_test_ood = y_test[ood_idx]
+
+        model.load_state_dict(best_state)
+        print("\n>>> OOD unseen-both — best AUROC model:")
+        ood_best = compute_metrics(model, x_test_ood, y_test_ood, device)
+        print_test_results(ood_best, f"{args.model} [OOD unseen-both]", args.pool)
+
+        ood_prob_df = pd.DataFrame(
+            {
+                "y_true": np.array(ood_best["labels"], dtype=int),
+                "y_prob_driver": np.array(ood_best["probs"], dtype=float),
+            }
+        )
+        ood_prob_plot = _plot_probability_distribution(
+            ood_prob_df,
+            out_dir / "plot_ood_unseen_both_prob_driver_distribution.png",
+            title="OOD unseen-both probability distribution",
+        )
+        if ood_prob_plot is not None:
+            probs_non = ood_prob_df.loc[ood_prob_df["y_true"] == 0, "y_prob_driver"].dropna()
+            probs_drv = ood_prob_df.loc[ood_prob_df["y_true"] == 1, "y_prob_driver"].dropna()
+            ood_prob_txt = _plot_txt_path(ood_prob_plot)
+            _write_text_lines(
+                ood_prob_txt,
+                [
+                    "OOD unseen-both probability distribution summary",
+                    f"true non-driver: n={len(probs_non)}, mean={float(probs_non.mean()):.6f}, std={float(probs_non.std(ddof=1)) if len(probs_non)>1 else 0.0:.6f}",
+                    f"true driver: n={len(probs_drv)}, mean={float(probs_drv.mean()):.6f}, std={float(probs_drv.std(ddof=1)) if len(probs_drv)>1 else 0.0:.6f}",
+                ],
+            )
+
+        model.load_state_dict(last_state)
+        print("\n>>> OOD unseen-both — last epoch model:")
+        ood_last = compute_metrics(model, x_test_ood, y_test_ood, device)
+        print_test_results(ood_last, f"{args.model} [OOD unseen-both]", args.pool)
+
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "ood_unseen_both/n_samples": int(len(ood_idx)),
+                    "ood_unseen_both/test_total": int(len(X_test)),
+                    "ood_unseen_both/test_valid_gene_rows": int(ood_stats["n_test_rows_valid_genes"]),
+                    "ood_unseen_both/train_gene_count": int(ood_stats["train_gene_count"]),
+                    "ood_best/accuracy": float(ood_best["acc"]),
+                    "ood_best/f1": float(ood_best["f1"]),
+                    "ood_best/auroc": float(ood_best["auroc"]),
+                    "ood_best/precision": float(ood_best["prec"]),
+                    "ood_best/recall": float(ood_best["rec"]),
+                    "ood_last/accuracy": float(ood_last["acc"]),
+                    "ood_last/f1": float(ood_last["f1"]),
+                    "ood_last/auroc": float(ood_last["auroc"]),
+                    "ood_last/precision": float(ood_last["prec"]),
+                    "ood_last/recall": float(ood_last["rec"]),
+                }
+            )
+            if ood_prob_plot is not None:
+                _wandb_log_image_path(
+                    wandb_run,
+                    "plots/plot_ood_unseen_both_prob_driver_distribution",
+                    ood_prob_plot,
+                )
+
     # Benchmark evaluation — load pre-computed benchmark embeddings
     gene_counts_train, _ = _build_gene_frequency_baseline(meta_train)
     bm_pt = emb_dir / "benchmark.pt"
@@ -2267,6 +2409,10 @@ def main():
         print(f"Benchmark linear-probe-vs-baselines plot saved to {bm_artifacts['metrics_plot']}")
     if bm_artifacts["metrics_txt"] is not None:
         print(f"Benchmark baseline metrics summary saved to {bm_artifacts['metrics_txt']}")
+    if ood_prob_plot is not None:
+        print(f"OOD unseen-both probability distribution plot saved to {ood_prob_plot}")
+    if ood_prob_txt is not None:
+        print(f"OOD unseen-both probability distribution summary saved to {ood_prob_txt}")
     if bm_artifacts["per_fusion_plot"] is not None:
         print(f"Benchmark per-fusion baseline comparison plot saved to {bm_artifacts['per_fusion_plot']}")
     if bm_artifacts["per_fusion_txt"] is not None:
@@ -2389,7 +2535,39 @@ def main():
         f"  - random_brier: {test_calibration['random_brier']:.6f}",
         f"  - random_calibration_quality (1-brier): {test_calibration['random_calibration_quality']:.6f}",
         f"  - brier_improvement_vs_random: {test_calibration['brier_improvement_vs_random']:.6f}",
+        "",
+        "OOD unseen-both-gene subset:",
+        f"  - n_ood: {ood_stats['n_ood_unseen_both']}",
+        f"  - n_test_total: {ood_stats['n_test_total']}",
+        f"  - n_test_valid_gene_rows: {ood_stats['n_test_rows_valid_genes']}",
+        f"  - train_gene_count: {ood_stats['train_gene_count']}",
+        f"  - probability_distribution_plot: {ood_prob_plot if ood_prob_plot is not None else 'N/A'}",
+        f"  - probability_distribution_summary: {ood_prob_txt if ood_prob_txt is not None else 'N/A'}",
     ]
+    if ood_best is not None:
+        summary_sections.extend(
+            [
+                "",
+                format_test_results(
+                    ood_best,
+                    f"{args.model} [OOD unseen-both]",
+                    args.pool,
+                    "OOD UNSEEN-BOTH-GENES - BEST AUROC MODEL",
+                ),
+            ]
+        )
+    if ood_last is not None:
+        summary_sections.extend(
+            [
+                "",
+                format_test_results(
+                    ood_last,
+                    f"{args.model} [OOD unseen-both]",
+                    args.pool,
+                    "OOD UNSEEN-BOTH-GENES - LAST EPOCH MODEL",
+                ),
+            ]
+        )
     if bm_pt.exists():
         summary_sections.extend([
             "",

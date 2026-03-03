@@ -41,13 +41,41 @@ def metric_summary_from_text(summary_text: str) -> dict[str, float]:
         raise ValueError("Unable to parse test metrics from train_probe summary.")
 
     accuracy, f1, auroc, precision, recall = match.groups()
-    return {
+    out = {
         "accuracy": to_float(accuracy),
         "f1": to_float(f1),
         "auroc": to_float(auroc),
         "precision": to_float(precision),
         "recall": to_float(recall),
     }
+    ood_pattern = re.compile(
+        r"OOD UNSEEN-BOTH-GENES - BEST AUROC MODEL.*?"
+        r"TEST RESULTS - .*?\n\s*Accuracy:\s*([0-9eE+\-.]+|nan)\n\s*F1:\s*([0-9eE+\-.]+|nan)\n\s*AUROC:\s*([0-9eE+\-.]+|nan)\n\s*Precision:\s*([0-9eE+\-.]+|nan)\n\s*Recall:\s*([0-9eE+\-.]+|nan)",
+        re.S,
+    )
+    ood_match = ood_pattern.search(summary_text)
+    if ood_match is None:
+        out.update(
+            {
+                "ood_accuracy": float("nan"),
+                "ood_f1": float("nan"),
+                "ood_auroc": float("nan"),
+                "ood_precision": float("nan"),
+                "ood_recall": float("nan"),
+            }
+        )
+    else:
+        ood_accuracy, ood_f1, ood_auroc, ood_precision, ood_recall = ood_match.groups()
+        out.update(
+            {
+                "ood_accuracy": to_float(ood_accuracy),
+                "ood_f1": to_float(ood_f1),
+                "ood_auroc": to_float(ood_auroc),
+                "ood_precision": to_float(ood_precision),
+                "ood_recall": to_float(ood_recall),
+            }
+        )
+    return out
 
 
 def parse_summary_metrics(summary_path: Path) -> dict[str, float]:
@@ -620,6 +648,11 @@ def train_grid(
                 "auroc": float("nan"),
                 "precision": float("nan"),
                 "recall": float("nan"),
+                "ood_accuracy": float("nan"),
+                "ood_f1": float("nan"),
+                "ood_auroc": float("nan"),
+                "ood_precision": float("nan"),
+                "ood_recall": float("nan"),
             }
         else:
             cmd = [
@@ -707,6 +740,11 @@ def train_grid(
             "auroc": metrics["auroc"],
             "precision": metrics["precision"],
             "recall": metrics["recall"],
+            "ood_accuracy": metrics["ood_accuracy"],
+            "ood_f1": metrics["ood_f1"],
+            "ood_auroc": metrics["ood_auroc"],
+            "ood_precision": metrics["ood_precision"],
+            "ood_recall": metrics["ood_recall"],
             "summary_path": str(summary_path),
             "probe_best_ckpt": str(ckpt_path),
         }
@@ -773,94 +811,13 @@ def collect_existing_training_records(policy: str, recon_mode: str, model: str, 
                 "auroc": metrics["auroc"],
                 "precision": metrics["precision"],
                 "recall": metrics["recall"],
+                "ood_accuracy": metrics["ood_accuracy"],
+                "ood_f1": metrics["ood_f1"],
+                "ood_auroc": metrics["ood_auroc"],
+                "ood_precision": metrics["ood_precision"],
+                "ood_recall": metrics["ood_recall"],
                 "summary_path": str(summary_path),
                 "probe_best_ckpt": str(run_dir / "probe_best.pt"),
             }
         )
     return records
-
-
-def find_latest_eval_dir(eval_root: Path) -> Path | None:
-    candidates = [path for path in eval_root.iterdir() if path.is_dir()]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
-
-
-def run_external_evaluation(
-    policy: str,
-    recon_mode: str,
-    model: str,
-    best_record: dict[str, Any],
-    dirs: dict[str, Path],
-    config: dict[str, Any],
-    skip_existing: bool,
-    dry_run: bool,
-    logger,
-) -> dict[str, str] | None:
-    if not bool(config.get("runtime", {}).get("enable_external_evaluation", False)):
-        logger.info(
-            "[%s/%s/%s] External evaluation disabled by config (runtime.enable_external_evaluation=false).",
-            policy,
-            recon_mode,
-            model,
-        )
-        return None
-
-    eval_input = Path(str(config["data"].get("evaluation_input_csv", "")))
-    if not eval_input.exists() and not dry_run:
-        logger.warning(
-            "[%s/%s/%s] Evaluation skipped, input CSV not found: %s",
-            policy,
-            recon_mode,
-            model,
-            eval_input,
-        )
-        return None
-
-    model_eval_root = dirs["evaluation"] / model
-    model_eval_root.mkdir(parents=True, exist_ok=True)
-
-    if skip_existing and model_eval_root.exists():
-        latest_existing = find_latest_eval_dir(model_eval_root)
-        if latest_existing is not None and (latest_existing / "analysis_report.txt").exists():
-            logger.info("[%s/%s/%s] Reusing existing evaluation: %s", policy, recon_mode, model, latest_existing)
-            return {
-                "evaluation_dir": str(latest_existing),
-                "analysis_report": str(latest_existing / "analysis_report.txt"),
-                "predictions_csv": str(latest_existing / "fusions_set_predictions.csv"),
-            }
-
-    eval_script = PROJECT_ROOT / "src" / "analysis" / "predict_fusions_set_driver.py"
-    cmd = [
-        sys.executable,
-        str(eval_script),
-        "--input-csv",
-        str(eval_input),
-        "--model-ckpt",
-        str(best_record["probe_best_ckpt"]),
-        "--embedding-model",
-        model,
-        "--pool",
-        str(config["training"].get("pool", "mean")),
-        "--output-dir",
-        str(model_eval_root),
-        "--emb-cache-dir",
-        str(model_eval_root / "embedding_cache"),
-    ]
-
-    run_command(cmd, logger=logger, cwd=PROJECT_ROOT, dry_run=dry_run)
-
-    if dry_run:
-        return None
-
-    latest_dir = find_latest_eval_dir(model_eval_root)
-    if latest_dir is None:
-        logger.warning("[%s/%s/%s] Evaluation finished but no output directory found.", policy, recon_mode, model)
-        return None
-
-    return {
-        "evaluation_dir": str(latest_dir),
-        "analysis_report": str(latest_dir / "analysis_report.txt"),
-        "predictions_csv": str(latest_dir / "fusions_set_predictions.csv"),
-    }

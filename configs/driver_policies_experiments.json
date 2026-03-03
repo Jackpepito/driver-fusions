@@ -6,8 +6,7 @@
   "data": {
     "chimerseq_csv": "/homes/gcapitani/Gene-Fusions/data/ChimerSeq4.csv",
     "census_tsv": "/homes/gcapitani/Gene-Fusions/data/Census_allFri Jun 27 11_25_18 2025.tsv",
-    "benchmark_csv": "/homes/gcapitani/driver-fusions/data/benchmark_fusions.csv",
-    "evaluation_input_csv": "/homes/gcapitani/driver-fusions/fusions_set1_17_results/fusions_set1_17_reconstructed_sequences.csv"
+    "benchmark_csv": "/homes/gcapitani/driver-fusions/data/benchmark_fusions.csv"
   },
   "reconstruction": {
     "genome_build": "all",

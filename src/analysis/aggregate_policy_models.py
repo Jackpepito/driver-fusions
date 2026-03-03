@@ -26,7 +26,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from analysis.predict_fusions_set_driver import build_model_from_checkpoint
+from experiment.probe_io import build_model_from_checkpoint
 from train_probe import (
     _compute_calibration_metrics,
     _compute_random_baseline,

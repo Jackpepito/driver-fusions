@@ -24,7 +24,6 @@ from experiment.pipeline import (
     expected_reconstruction_paths,
     run_clustering,
     run_embeddings,
-    run_external_evaluation,
     run_reconstruction,
     to_float,
     to_metric_rank,
@@ -64,7 +63,6 @@ def main() -> None:
     selected_stages = stages_from_arg(args.stages)
     label_only = selected_stages == {"label"}
     skip_existing = bool(config.get("runtime", {}).get("skip_existing", True)) or args.skip_existing
-    external_evaluation_enabled = bool(config.get("runtime", {}).get("enable_external_evaluation", False))
 
     workspace_root = Path(str(config["workspace_root"]))
     workspace_root.mkdir(parents=True, exist_ok=True)
@@ -79,7 +77,6 @@ def main() -> None:
     logger.info("Workspace root: %s", workspace_root)
     logger.info("Dry run: %s", args.dry_run)
     logger.info("Skip existing: %s", skip_existing)
-    logger.info("External evaluation enabled: %s", external_evaluation_enabled)
 
     data_cfg = config["data"]
     chimerseq_path = Path(str(data_cfg["chimerseq_csv"]))
@@ -212,30 +209,7 @@ def main() -> None:
 
                 records_for_setting: list[dict[str, Any]] = []
                 best_for_setting: dict[str, Any] | None = None
-                live_evaluate_during_training = (
-                    "train" in selected_stages
-                    and "evaluate" in selected_stages
-                    and external_evaluation_enabled
-                )
-
                 if "train" in selected_stages:
-                    on_trained_record = None
-                    if live_evaluate_during_training and not args.dry_run:
-                        def _evaluate_after_train(record: dict[str, Any]) -> None:
-                            run_external_evaluation(
-                                policy=policy,
-                                recon_mode=recon_mode,
-                                model=model,
-                                best_record=record,
-                                dirs=dirs,
-                                config=config,
-                                skip_existing=False,
-                                dry_run=False,
-                                logger=logger,
-                            )
-
-                        on_trained_record = _evaluate_after_train
-
                     records_for_setting, best_for_setting = train_grid(
                         policy=policy,
                         recon_mode=recon_mode,
@@ -245,7 +219,6 @@ def main() -> None:
                         skip_existing=skip_existing,
                         dry_run=args.dry_run,
                         logger=logger,
-                        on_trained_record=on_trained_record,
                     )
                 elif "compare" in selected_stages or "evaluate" in selected_stages:
                     records_for_setting = collect_existing_training_records(
@@ -277,23 +250,9 @@ def main() -> None:
                         to_float(best_for_setting["f1"]),
                     )
 
-                    if "evaluate" in selected_stages and external_evaluation_enabled:
-                        eval_outputs = run_external_evaluation(
-                            policy=policy,
-                            recon_mode=recon_mode,
-                            model=model,
-                            best_record=best_for_setting,
-                            dirs=dirs,
-                            config=config,
-                            skip_existing=(skip_existing and not live_evaluate_during_training),
-                            dry_run=args.dry_run,
-                            logger=logger,
-                        )
-                        if eval_outputs is not None:
-                            best_for_setting = {**best_for_setting, **eval_outputs}
-                    elif "evaluate" in selected_stages and not external_evaluation_enabled:
+                    if "evaluate" in selected_stages:
                         logger.info(
-                            "[%s/%s/%s] External evaluation disabled by config (runtime.enable_external_evaluation=false).",
+                            "[%s/%s/%s] Evaluate stage uses in-training metrics (test + OOD) logged by train_probe/W&B.",
                             policy,
                             recon_mode,
                             model,
