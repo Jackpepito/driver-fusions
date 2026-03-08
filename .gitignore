@@ -24,3 +24,4 @@ src/analysis/__pycache__/predict_fusions_set_driver.cpython-311.pyc
 *.pyc
 *.pdf
 wandb/*
+B_ORF*
