@@ -16,6 +16,7 @@ from experiment.labeling import (
     label_dataset_for_policy,
     load_census_genes,
     prepare_chimerseq_base,
+    save_labeling_distribution_plots,
 )
 from experiment.logging_utils import setup_logger, write_json, write_text
 from experiment.pipeline import (
@@ -137,6 +138,11 @@ def main() -> None:
                 labeled_csv.parent.mkdir(parents=True, exist_ok=True)
                 labeled_df.to_csv(labeled_csv, index=False)
                 write_text(summary_txt, create_policy_summary(policy, labeled_df))
+                plot_artifacts = save_labeling_distribution_plots(
+                    labeled_df=labeled_df,
+                    output_root=labeled_csv.parent / "distribution_plots",
+                    policy=policy,
+                )
                 logger.info(
                     "Policy %s labeled rows: %d (drivers=%d, non-drivers=%d)",
                     policy,
@@ -144,6 +150,12 @@ def main() -> None:
                     int((labeled_df["driver"] == "driver").sum()),
                     int((labeled_df["driver"] == "non-driver").sum()),
                 )
+                if plot_artifacts:
+                    logger.info(
+                        "Policy %s labeling distribution artifacts saved: %s",
+                        policy,
+                        [str(path) for path in plot_artifacts],
+                    )
         else:
             logger.info("Policy labels already exist, reusing %s", labeled_csv)
 

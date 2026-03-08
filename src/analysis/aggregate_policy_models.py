@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build ensemble and weight-merged probe baselines for one training setting."""
+"""Build ensemble probe baseline for one training setting."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,12 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+
+# Ensure `src` is importable when this file is executed directly
+# (e.g. `python src/analysis/aggregate_policy_models.py`).
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 from experiment.probe_io import build_model_from_checkpoint
 from train_probe import (
@@ -65,31 +72,6 @@ def _predict_probs(ckpt_path: Path, X: torch.Tensor, device: str) -> np.ndarray:
         raise ValueError(f"Only binary probes are supported. Got out_dim={out_dim} for {ckpt_path}")
     logits = model(X.to(device))
     return torch.softmax(logits, dim=1)[:, 1].cpu().numpy().astype(float)
-
-
-def _state_signature(state: dict[str, torch.Tensor]) -> tuple[tuple[str, tuple[int, ...], str], ...]:
-    return tuple(
-        sorted((str(k), tuple(v.shape), str(v.dtype)) for k, v in state.items() if isinstance(v, torch.Tensor))
-    )
-
-
-def _merge_state_dicts(states: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    if not states:
-        raise ValueError("No states to merge")
-    keys = list(states[0].keys())
-    merged: dict[str, torch.Tensor] = {}
-    for k in keys:
-        vals = [s[k] for s in states]
-        first = vals[0]
-        if not isinstance(first, torch.Tensor):
-            merged[k] = first
-            continue
-        if first.dtype.is_floating_point:
-            stacked = torch.stack([v.detach().cpu().to(torch.float32) for v in vals], dim=0)
-            merged[k] = stacked.mean(dim=0).to(first.dtype)
-        else:
-            merged[k] = first.detach().cpu().clone()
-    return merged
 
 
 def _plot_confusion(cm: np.ndarray, title: str, out_path: Path) -> None:
@@ -136,7 +118,7 @@ def _wandb_log_all(
         mode=args.wandb_mode,
         dir=args.wandb_dir,
         name=f"{setting_id}_aggregate",
-        tags=tags + ["aggregate", "ensemble", "weight-merge"],
+        tags=tags + ["aggregate", "ensemble"],
         config={
             "setting_id": setting_id,
             "policy": str(args.policy).strip().upper(),
@@ -295,7 +277,7 @@ def _evaluate_method(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Aggregate trained probes into ensemble and weight-merge baselines.")
+    parser = argparse.ArgumentParser(description="Aggregate trained probes into ensemble baseline.")
     parser.add_argument("--embeddings-dir", required=True, help="Root embedding directory containing <model>/*.pt")
     parser.add_argument("--model", required=True, choices=["esmc", "fuson"])
     parser.add_argument("--pool", default="mean", choices=["mean", "cls"])
@@ -343,13 +325,18 @@ def main() -> None:
 
     probs_by_ckpt: list[np.ndarray] = []
     probs_bm_by_ckpt: list[np.ndarray] = []
-    states_by_ckpt: list[tuple[Path, dict[str, torch.Tensor], tuple[Any, ...]]] = []
     for ckpt in ckpts:
-        probs_by_ckpt.append(_predict_probs(ckpt, X_test, device))
-        if X_bm is not None:
-            probs_bm_by_ckpt.append(_predict_probs(ckpt, X_bm, device))
-        state = torch.load(ckpt, map_location="cpu", weights_only=False)
-        states_by_ckpt.append((ckpt, state, _state_signature(state)))
+        try:
+            probs_test = _predict_probs(ckpt, X_test, device)
+            probs_bm = _predict_probs(ckpt, X_bm, device) if X_bm is not None else None
+            probs_by_ckpt.append(probs_test)
+            if X_bm is not None:
+                probs_bm_by_ckpt.append(probs_bm)
+        except Exception as exc:
+            print(f"[WARNING] Skipping checkpoint due to load/predict failure: {ckpt} ({exc})")
+
+    if not probs_by_ckpt:
+        raise RuntimeError("All checkpoints failed during aggregation; no valid model available.")
 
     ensemble_probs = np.mean(np.stack(probs_by_ckpt, axis=0), axis=0)
     ensemble_bm_probs = np.mean(np.stack(probs_bm_by_ckpt, axis=0), axis=0) if probs_bm_by_ckpt else None
@@ -365,33 +352,9 @@ def main() -> None:
         y_benchmark=y_bm_np,
     )
 
-    grouped: dict[tuple[Any, ...], list[tuple[Path, dict[str, torch.Tensor], tuple[Any, ...]]]] = {}
-    for item in states_by_ckpt:
-        grouped.setdefault(item[2], []).append(item)
-    best_sig = max(grouped.keys(), key=lambda sig: len(grouped[sig]))
-    merge_group = grouped[best_sig]
-    merge_ckpts = [p for p, _, _ in merge_group]
-    merge_states = [s for _, s, _ in merge_group]
-    merged_state = _merge_state_dicts(merge_states)
-    merged_ckpt = out_root / "merged_probe.pt"
-    torch.save(merged_state, merged_ckpt)
-    merged_probs = _predict_probs(merged_ckpt, X_test, device)
-    merged_bm_probs = _predict_probs(merged_ckpt, X_bm, device) if X_bm is not None else None
-    merged_out = _evaluate_method(
-        "weight_merge",
-        merged_probs,
-        y_test_np,
-        meta_train,
-        meta_test,
-        out_root,
-        pool=args.pool,
-        probs_benchmark=merged_bm_probs,
-        y_benchmark=y_bm_np,
-    )
-
     summary_rows: list[dict[str, Any]] = []
-    method_outputs = {"ensemble": ensemble_out, "weight_merge": merged_out}
-    for out in (ensemble_out, merged_out):
+    method_outputs = {"ensemble": ensemble_out}
+    for out in (ensemble_out,):
         m = out["metrics"]
         c = out["calibration"]
         bm = out["benchmark_metrics"] or {}
@@ -423,10 +386,8 @@ def main() -> None:
             ),
             "summary_path": str(out["summary_txt"]),
             "analysis_dir": str(out["method_dir"]),
-            "probe_best_ckpt": str(merged_ckpt) if method == "weight_merge" else "",
-            "n_ensemble_members": int(len(ckpts)),
-            "n_merged_members": int(len(merge_ckpts)),
-            "merged_signature_groups": int(len(grouped)),
+            "probe_best_ckpt": "",
+            "n_ensemble_members": int(len(probs_by_ckpt)),
         }
         summary_rows.append(row)
 
@@ -435,8 +396,7 @@ def main() -> None:
             {
                 "setting_id": setting_id,
                 "n_checkpoints_input": len(ckpts),
-                "n_checkpoints_merged": len(merge_ckpts),
-                "merge_ckpts": [str(p) for p in merge_ckpts],
+                "n_checkpoints_used": len(probs_by_ckpt),
                 "output_root": str(out_root),
             },
             indent=2,

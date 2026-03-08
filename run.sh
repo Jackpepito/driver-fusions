@@ -12,6 +12,7 @@
 #SBATCH --account=H2020DeciderFicarra
 
 # L'indice dell'array seleziona la policy da eseguire (A/B/C/D)
+#label,reconstruct,cluster,embed,train,evaluate,compare
 export PYTHONUNBUFFERED=1
 export WANDB_MODE=online
 
@@ -31,4 +32,4 @@ echo "Starting policy ${POLICY} for task ${SLURM_ARRAY_TASK_ID}"
 srun python "${PROJECT_DIR}/src/run.py" \
   --config "${PROJECT_DIR}/configs/driver_policies_experiments.json" \
   --policy "${POLICY}" \
-  --stages label,reconstruct,cluster,embed,train,evaluate
+  --stages embed,train,evaluate

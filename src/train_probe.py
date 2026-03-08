@@ -2111,11 +2111,28 @@ def main():
         ood_idx = np.flatnonzero(ood_mask)
         x_test_ood = X_test[ood_idx]
         y_test_ood = y_test[ood_idx]
+        ood_random_preds = None
+        ood_gene_preds = None
+        ood_random_metrics = None
+        ood_gene_metrics = None
 
         model.load_state_dict(best_state)
         print("\n>>> OOD unseen-both — best AUROC model:")
         ood_best = compute_metrics(model, x_test_ood, y_test_ood, device)
         print_test_results(ood_best, f"{args.model} [OOD unseen-both]", args.pool)
+        ood_random_preds, _ = _compute_random_baseline(np.array(ood_best["labels"]), seed=42)
+        ood_random_metrics = _baseline_metrics(np.array(ood_best["labels"], dtype=int), np.array(ood_random_preds, dtype=int))
+
+        test_rows = meta_test.get("metadata_rows") if isinstance(meta_test, dict) else None
+        if isinstance(test_rows, list) and test_rows:
+            ood_rows = [test_rows[int(i)] for i in ood_idx if int(i) < len(test_rows)]
+            if len(ood_rows) == len(ood_idx):
+                gene_counts_ood, _ = _build_gene_frequency_baseline(meta_train)
+                ood_gene_preds = _predict_gene_frequency_baseline(pd.DataFrame(ood_rows), gene_counts_ood)
+                ood_gene_metrics = _baseline_metrics(
+                    np.array(ood_best["labels"], dtype=int),
+                    np.array(ood_gene_preds, dtype=int),
+                )
 
         ood_prob_df = pd.DataFrame(
             {
@@ -2163,8 +2180,48 @@ def main():
                     "ood_last/auroc": float(ood_last["auroc"]),
                     "ood_last/precision": float(ood_last["prec"]),
                     "ood_last/recall": float(ood_last["rec"]),
+                    "ood_random_baseline/accuracy": float(ood_random_metrics["accuracy"]) if ood_random_metrics is not None else float("nan"),
+                    "ood_random_baseline/f1": float(ood_random_metrics["f1"]) if ood_random_metrics is not None else float("nan"),
+                    "ood_random_baseline/precision": float(ood_random_metrics["precision"]) if ood_random_metrics is not None else float("nan"),
+                    "ood_random_baseline/recall": float(ood_random_metrics["recall"]) if ood_random_metrics is not None else float("nan"),
+                    "ood_random_baseline/predicted_driver_rate": float(ood_random_metrics["predicted_driver_rate"]) if ood_random_metrics is not None else float("nan"),
+                    "ood_gene_baseline/accuracy": float(ood_gene_metrics["accuracy"]) if ood_gene_metrics is not None else float("nan"),
+                    "ood_gene_baseline/f1": float(ood_gene_metrics["f1"]) if ood_gene_metrics is not None else float("nan"),
+                    "ood_gene_baseline/precision": float(ood_gene_metrics["precision"]) if ood_gene_metrics is not None else float("nan"),
+                    "ood_gene_baseline/recall": float(ood_gene_metrics["recall"]) if ood_gene_metrics is not None else float("nan"),
+                    "ood_gene_baseline/predicted_driver_rate": float(ood_gene_metrics["predicted_driver_rate"]) if ood_gene_metrics is not None else float("nan"),
                 }
             )
+            _wandb_log_confusion(
+                wandb_run,
+                key="confusion/ood_unseen_both_best",
+                y_true=np.array(ood_best["labels"]),
+                y_pred=np.array(ood_best["preds"]),
+                title="OOD unseen-both best confusion matrix",
+            )
+            _wandb_log_confusion(
+                wandb_run,
+                key="confusion/ood_unseen_both_last",
+                y_true=np.array(ood_last["labels"]),
+                y_pred=np.array(ood_last["preds"]),
+                title="OOD unseen-both last confusion matrix",
+            )
+            if ood_random_preds is not None:
+                _wandb_log_confusion(
+                    wandb_run,
+                    key="confusion/ood_unseen_both_random_baseline",
+                    y_true=np.array(ood_best["labels"]),
+                    y_pred=np.array(ood_random_preds),
+                    title="OOD unseen-both random baseline confusion matrix",
+                )
+            if ood_gene_preds is not None and len(ood_gene_preds) == len(ood_best["labels"]):
+                _wandb_log_confusion(
+                    wandb_run,
+                    key="confusion/ood_unseen_both_gene_baseline",
+                    y_true=np.array(ood_best["labels"]),
+                    y_pred=np.array(ood_gene_preds),
+                    title="OOD unseen-both gene baseline confusion matrix",
+                )
             if ood_prob_plot is not None:
                 _wandb_log_image_path(
                     wandb_run,

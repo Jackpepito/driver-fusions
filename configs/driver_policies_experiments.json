@@ -2,7 +2,7 @@
   "workspace_root": "/work/H2020DeciderFicarra/gcapitani",
   "policies": ["A", "B", "C", "D"],
   "recon_modes": ["ORF"],
-  "models": ["esmc", "fuson"],
+  "models": ["fuson"],
   "data": {
     "chimerseq_csv": "/homes/gcapitani/Gene-Fusions/data/ChimerSeq4.csv",
     "census_tsv": "/homes/gcapitani/Gene-Fusions/data/Census_allFri Jun 27 11_25_18 2025.tsv",
